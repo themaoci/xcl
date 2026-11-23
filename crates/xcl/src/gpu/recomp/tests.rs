@@ -7417,8 +7417,11 @@ fn gpu_s_round_mode_controls_f16_rounding_across_modes() {
         assert_eq!(v[14] as u16, rne, "lane {l} ({bits:#010x}) reset to RNE");
         assert_eq!(v[15] as u16, rtn, "lane {l} ({bits:#010x}) setreg_imm32 partial -> -inf");
         assert_eq!(v[16] as u16, rtp, "lane {l} ({bits:#010x}) setreg_b32 dynamic -> +inf");
-        assert_eq!(v[22] as u16, rne, "lane {l} ({bits:#010x}) v_fma_mixlo_f16 RNE");
-        assert_eq!(v[25] as u16, rtz, "lane {l} ({bits:#010x}) v_fma_mixlo_f16 RTZ");
+        // fma(-0, 1, +0) is +0 (IEEE; the conversion of -0 keeps its sign) – the console's fma does
+        // not fold to its first operand, DXC's mad(x, 1, 0) did
+        let (mix_rne, mix_rtz) = if bits == 0x8000_0000 { (0x0000, 0x0000) } else { (rne, rtz) };
+        assert_eq!(v[22] as u16, mix_rne, "lane {l} ({bits:#010x}) v_fma_mixlo_f16 RNE");
+        assert_eq!(v[25] as u16, mix_rtz, "lane {l} ({bits:#010x}) v_fma_mixlo_f16 RTZ");
     }
     // Verify V_MUL_F16 & V_PK_MUL_F16 honor RNE vs RTZ
     assert_eq!(r.vgpr[0][20] as u16, 0x7C00, "v_mul_f16 overflow RNE");
@@ -7433,30 +7436,193 @@ fn gpu_s_round_mode_controls_f16_rounding_across_modes() {
 }
 
 #[test]
-fn gpu_mad_nf_f16_rounds_intermediate_in_binary16() {
+/// The helpers of `PRELUDE_F16_RM` fold a sticky bit (the sign of the f32 result's rounding error)
+/// into one binary16 rounding: on a binary16 value or midpoint it decides the direction (#111).
+fn gpu_f16_rounding_helpers_fold_the_sticky_bit() {
     if !gpu_ready() {
         return;
     }
-    // Compile a wave32 kernel containing the recompiler PRELUDE and exercise `mad_nf_f16` directly.
     let base = prog(&[("V_MOV_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", V + 0)], None)]);
     let opt = Options { wave64: false, hw_wave: 32, ..Options::default() };
     let mut hlsl = translate(&base, &opt).unwrap().hlsl;
-    let probe = "\
-    if (lane_id == 0u) v0 = f32_to_f16_rm(mad_nf_f16(f16tof32(0x7BFFu), f16tof32(0x3C01u), f16tof32(0xFBFFu), 0u), 0u);\n\
-    if (lane_id == 1u) v0 = f32_to_f16_rm(mad_nf_f16(f16tof32(0x7BFFu), f16tof32(0x3C01u), f16tof32(0xFBFFu), 3u), 3u);\n\
-    if (lane_id == 2u) v0 = f32_to_f16_rm(mad_nf_f16(f16tof32(0x3C01u), f16tof32(0x3C01u), f16tof32(0xBC02u), 0u), 0u);\n";
+    assert!(hlsl.contains("[WaveSize("), "unexpected kernel:\n{hlsl}");
+    hlsl = hlsl.replacen("[WaveSize(", &format!("{}[WaveSize(", super::emit::PRELUDE_F16_RM), 1);
+    // (probe expression, expected binary16)
+    let probes: &[(&str, u32)] = &[
+        // a binary16 value with the exact value just beyond it: directed modes step past it, RNE stays
+        ("f32_to_f16_rm_sticky(1.0f, 1, 1u)", 0x3C01),
+        ("f32_to_f16_rm_sticky(1.0f, 1, 0u)", 0x3C00),
+        ("f32_to_f16_rm_sticky(1.0f, 1, 2u)", 0x3C00),
+        ("f32_to_f16_rm_sticky(2.0f, -1, 3u)", 0x3FFF),
+        ("f32_to_f16_rm_sticky(-1.0f, -1, 2u)", 0xBC01),
+        ("f32_to_f16_rm_sticky(-1.0f, -1, 1u)", 0xBC00),
+        ("f32_to_f16_rm_sticky(-1.0f, 1, 3u)", 0xBBFF),
+        // a midpoint with a sticky bit is no tie: 1 + 2^-11
+        ("f32_to_f16_rm_sticky(asfloat(0x3F801000u), -1, 0u)", 0x3C00),
+        ("f32_to_f16_rm_sticky(asfloat(0x3F801000u), 1, 0u)", 0x3C01),
+        // 65520: the overflow tie
+        ("f32_to_f16_rm_sticky(asfloat(0x477FF000u), -1, 0u)", 0x7BFF),
+        ("f32_to_f16_rm_sticky(asfloat(0x477FF000u), 1, 0u)", 0x7C00),
+        ("f32_to_f16_rm_sticky(asfloat(0x477FF000u), 0, 0u)", 0x7C00),
+        // 2^-25: the tie below the smallest subnormal
+        ("f32_to_f16_rm_sticky(asfloat(0x33000000u), 1, 0u)", 0x0001),
+        ("f32_to_f16_rm_sticky(asfloat(0x33000000u), -1, 0u)", 0x0000),
+        // the largest finite value, exact value above it
+        ("f32_to_f16_rm_sticky(65504.0f, 1, 1u)", 0x7C00),
+        ("f32_to_f16_rm_sticky(65504.0f, 1, 3u)", 0x7BFF),
+        // the smallest subnormal, exact value below it, toward zero
+        ("f32_to_f16_rm_sticky(asfloat(0x33800000u), -1, 3u)", 0x0000),
+        // no sticky: as before
+        ("f32_to_f16_rm(asfloat(0x3F801000u), 0u)", 0x3C00),
+        ("f32_to_f16_rm(asfloat(0x3F803000u), 0u)", 0x3C02),
+        // add_f16_rm: 1 + 2^-24 with OMOD *2 (2 + 2^-23), with CLAMP (1.0)
+        ("add_f16_rm(1.0f, asfloat(0x33800000u), 2.0f, false, 1u)", 0x4001),
+        ("add_f16_rm(1.0f, asfloat(0x33800000u), 2.0f, false, 3u)", 0x4000),
+        ("add_f16_rm(1.0f, asfloat(0x33800000u), 1.0f, true, 1u)", 0x3C00),
+        ("add_f16_rm(-1.0f, asfloat(0x33800000u), 1.0f, true, 2u)", 0x0000),
+        // fma_f16_rm RNE tie through f32: 1.5 * (1 + 2^-10) - 2^-24 is below the midpoint 1.5 + 2^-10 + 2^-11
+        ("fma_f16_rm(1.5f, f16tof32(0x3C01u), -asfloat(0x33800000u), 1.0f, false, 0u)", 0x3E01),
+        ("fma_f16_rm(1.5f, f16tof32(0x3C01u), -asfloat(0x33800000u), 1.0f, false, 1u)", 0x3E02),
+        // fma_mix_f16_rm: f32 sources, 1 * 1 + 2^-30
+        ("fma_mix_f16_rm(1.0f, 1.0f, asfloat(0x30800000u), false, 1u)", 0x3C01),
+        ("fma_mix_f16_rm(1.0f, 1.0f, asfloat(0x30800000u), false, 0u)", 0x3C00),
+        ("fma_mix_f16_rm(1.0f, 1.0f, asfloat(0x30800000u), true, 1u)", 0x3C00),
+        // the product of two f32 values is exact in the double: (1 + 2^-23)^2 = 1 + 2^-22 + 2^-46
+        ("fma_mix_f16_rm(asfloat(0x3F800001u), asfloat(0x3F800001u), 0.0f, false, 3u)", 0x3C00),
+        ("fma_mix_f16_rm(asfloat(0x3F800001u), asfloat(0x3F800001u), 0.0f, false, 1u)", 0x3C01),
+        // #128 review (Foniass): 65536 - 2^-24 is past the midpoint 65520 – RNE overflows; 256 * 256 - 2^-24
+        ("f32_to_f16_rm_sticky(65536.0f, -1, 0u)", 0x7C00),
+        ("fma_f16_rm(f16tof32(0x5C00u), f16tof32(0x5C00u), f16tof32(0x8001u), 1.0f, false, 0u)", 0x7C00),
+        ("fma_f16_rm(f16tof32(0x5C00u), f16tof32(0x5C00u), f16tof32(0x8001u), 1.0f, false, 3u)", 0x7BFF),
+        ("add_f16_rm(f16tof32(0x7800u), f16tof32(0x8001u), 2.0f, false, 0u)", 0x7C00),
+        ("fma_mix_f16_rm(1.0f, 65536.0f, -asfloat(0x30800000u), false, 0u)", 0x7C00),
+        // mix results beyond f32's range: the mode alone decides
+        ("fma_mix_f16_rm(asfloat(0x71800000u), asfloat(0x71800000u), 0.0f, false, 3u)", 0x7BFF),
+        ("fma_mix_f16_rm(asfloat(0x71800000u), asfloat(0x71800000u), 0.0f, false, 0u)", 0x7C00),
+        ("fma_mix_f16_rm(asfloat(0x0D800000u), asfloat(0x0D800000u), 0.0f, false, 1u)", 0x0001),
+        ("fma_mix_f16_rm(asfloat(0x0D800000u), asfloat(0x0D800000u), 0.0f, false, 0u)", 0x0000),
+        // the sign of an exact zero: x + -x is +0, -0 under -inf; -0 + -0 stays -0; +0 + +0 stays +0
+        ("add_f16_rm(1.0f, -1.0f, 1.0f, false, 0u)", 0x0000),
+        ("add_f16_rm(1.0f, -1.0f, 1.0f, false, 2u)", 0x8000),
+        ("add_f16_rm(-0.0f, -0.0f, 1.0f, false, 0u)", 0x8000),
+        ("add_f16_rm(0.0f, 0.0f, 1.0f, false, 2u)", 0x0000),
+        ("add_f16_rm(0.0f, -0.0f, 1.0f, false, 2u)", 0x8000),
+        ("fma_mix_f16_rm(-0.0f, 1.0f, 0.0f, false, 0u)", 0x0000),
+    ];
     let marker = "    v0 = select((((exec_lo >> lane_id) & 1u) != 0u), (v0), v0);\n";
     assert!(hlsl.contains(marker), "unexpected kernel body:\n{hlsl}");
-    hlsl = hlsl.replace(marker, probe);
+    // 32 lanes per kernel: the probes go in as many kernels as it takes
+    for chunk in probes.chunks(32) {
+        let mut probe = String::new();
+        for (l, (e, _)) in chunk.iter().enumerate() {
+            probe.push_str(&format!("    if (lane_id == {l}u) v0 = {e};\n"));
+        }
+        let dxil = super::dxc::compile(&hlsl.replace(marker, &probe), "main", "cs_6_6", &[]).unwrap();
+        let mut st = KernelState::default();
+        st.sgpr[127] = 0;
+        let r = runner::run(&dxil, &st, &[]).unwrap();
+        for (l, (e, want)) in chunk.iter().enumerate() {
+            assert_eq!(r.vgpr[l][0], *want, "lane {l}: {e}");
+        }
+    }
+}
 
-    let dxil = super::dxc::compile(&hlsl, "main", "cs_6_6", &[]).unwrap();
+#[test]
+/// f16 add / sub / fma / pk / mix under `s_round_mode`: the exact result rounded once (#111 – through
+/// f32 and RNE, 1.0 + 2^-24 under +inf gave 1.0; the console gives 1 + 2^-10).
+fn gpu_f16_add_and_fma_round_once_under_directed_modes() {
+    if !gpu_ready() {
+        return;
+    }
+    // Per lane: a, b (binary16), m1 * m2 + b for the fma (m2 = 1.0 unless the lane says otherwise),
+    // expected add / sub [RNE, +inf, -inf, RTZ], expected fma.
+    struct Case {
+        a: u32,
+        b: u32,
+        m1: u32,
+        m2: u32,
+        add: [u32; 4],
+        fma: [u32; 4],
+    }
+    let same = |a, b, r: [u32; 4]| Case { a, b, m1: a, m2: 0x3C00, add: r, fma: r };
+    let cases = [
+        same(0x3C00, 0x0001, [0x3C00, 0x3C01, 0x3C00, 0x3C00]), // 1 + 2^-24
+        same(0x4000, 0x8001, [0x4000, 0x4000, 0x3FFF, 0x3FFF]), // 2 - 2^-24
+        same(0xBC00, 0x8001, [0xBC00, 0xBC00, 0xBC01, 0xBC00]), // -1 - 2^-24
+        same(0xC000, 0x0001, [0xC000, 0xBFFF, 0xC000, 0xBFFF]), // -2 + 2^-24
+        same(0x7BFF, 0x0001, [0x7BFF, 0x7C00, 0x7BFF, 0x7BFF]), // 65504 + 2^-24
+        same(0x3C00, 0x3C00, [0x4000, 0x4000, 0x4000, 0x4000]), // exact
+        same(0x0400, 0x8001, [0x03FF, 0x03FF, 0x03FF, 0x03FF]), // 2^-14 - 2^-24: exact subnormal
+        same(0x7BFF, 0x5000, [0x7C00, 0x7C00, 0x7BFF, 0x7BFF]), // 65504 + 32 = 65536: overflow
+        // 1.5 * (1 + 2^-10) - 2^-24: the f32 sum ties and lands on the binary16 midpoint; the exact
+        // value is below it (add: 1.5 - 2^-24)
+        Case { a: 0x3E00, b: 0x8001, m1: 0x3E00, m2: 0x3C01, add: [0x3E00, 0x3E00, 0x3DFF, 0x3DFF], fma: [0x3E01, 0x3E02, 0x3E01, 0x3E01] },
+    ];
+    // Constant across the lanes: packed halves (low: case 0, high: case 1), mix 1 * 1 + 2^-30 (f32).
+    let pk: [u32; 4] = [0x4000_3C00, 0x4000_3C01, 0x3FFF_3C00, 0x3FFF_3C00];
+    let mix: [u32; 4] = [0x3C00, 0x3C01, 0x3C00, 0x3C00];
+    // Blocks of results: mode -> VGPR base; results +0 add, +1 fma, +2 pk add, +3 pk fma, +4 mixlo,
+    // +5 sub, +6 add * 2 (OMOD), +7 add clamped.
+    let blocks: [(u64, usize, u64); 4] = [(0x4, 1, 10), (0xC, 3, 20), (0x8, 2, 30), (0x0, 0, 40)];
+    let mut list: Vec<(&str, &str, Vec<(&str, u64)>, Option<u32>)> = Vec::new();
+    for &(mode, _, base) in &blocks {
+        list.push(("S_ROUND_MODE", "ENC_SOPP", vec![("SIMM16", mode)], None));
+        // inputs in v50.. (the result blocks take v10..v47)
+        list.push(("V_ADD_F16", "ENC_VOP2", vec![("VDST", base), ("SRC0", V + 50), ("VSRC1", 51)], None));
+        list.push(("V_FMA_F16", "ENC_VOP3", vec![("VDST", base + 1), ("SRC0", V + 52), ("SRC1", V + 53), ("SRC2", V + 51)], None));
+        list.push(("V_PK_ADD_F16", "ENC_VOP3P", vec![("VDST", base + 2), ("SRC0", V + 54), ("SRC1", V + 55), ("OP_SEL_HI", 3)], None));
+        list.push(("V_PK_FMA_F16", "ENC_VOP3P", vec![("VDST", base + 3), ("SRC0", V + 56), ("SRC1", V + 57), ("SRC2", V + 55), ("OP_SEL_HI", 3), ("OP_SEL_HI_2", 1)], None));
+        list.push(("V_FMA_MIXLO_F16", "ENC_VOP3P", vec![("VDST", base + 4), ("SRC0", V + 58), ("SRC1", V + 59), ("SRC2", V + 60)], None));
+        list.push(("V_SUB_F16", "ENC_VOP2", vec![("VDST", base + 5), ("SRC0", V + 50), ("VSRC1", 61)], None));
+        list.push(("V_ADD_F16", "ENC_VOP3", vec![("VDST", base + 6), ("SRC0", V + 50), ("SRC1", V + 51), ("OMOD", 1)], None));
+        list.push(("V_ADD_F16", "ENC_VOP3", vec![("VDST", base + 7), ("SRC0", V + 50), ("SRC1", V + 51), ("CLAMP", 1)], None));
+    }
+    let list: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(n, e, f, l)| (*n, *e, f.as_slice(), *l)).collect();
+    let code = prog(&list);
+    let opt = Options { wave64: false, hw_wave: 32, ..Options::default() };
+    let t = translate(&code, &opt).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    assert!(t.hlsl.contains("add_f16_rm(") && t.hlsl.contains("fma_f16_rm(") && t.hlsl.contains("fma_mix_f16_rm("), "{}", t.hlsl);
+    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+
     let mut st = KernelState::default();
     st.sgpr[127] = 0;
+    for (l, c) in cases.iter().enumerate() {
+        let v = &mut st.vgpr[l];
+        v[50] = c.a;
+        v[51] = c.b;
+        v[52] = c.m1;
+        v[53] = c.m2;
+        v[54] = 0x4000_3C00;
+        v[55] = 0x8001_0001;
+        v[56] = 0x4000_3C00;
+        v[57] = 0x3C00_3C00;
+        v[58] = 0x3F80_0000;
+        v[59] = 0x3F80_0000;
+        v[60] = 0x3080_0000;
+        v[61] = c.b ^ 0x8000;
+    }
     let r = runner::run(&dxil, &st, &[]).unwrap();
-
-    assert_eq!(r.vgpr[0][0], 0x7C00, "mad_nf_f16 RNE overflow: 65504*(1+2^-10)-65504 -> +inf");
-    assert_eq!(r.vgpr[1][0], 0x0000, "mad_nf_f16 RTZ clamp: 65504*(1+2^-10)->65504, -65504 -> 0");
-    assert_eq!(r.vgpr[2][0], 0x0000, "mad_nf_f16 cancellation: (1+2^-10)^2-(1+2^-9) -> 0 (not 2^-20)");
+    for (l, c) in cases.iter().enumerate() {
+        let v = &r.vgpr[l];
+        for &(mode, k, base) in &blocks {
+            let base = base as usize;
+            assert_eq!(v[base], c.add[k], "lane {l} mode {mode:#x}: v_add_f16 {:#06x} + {:#06x}", c.a, c.b);
+            assert_eq!(v[base + 1], c.fma[k], "lane {l} mode {mode:#x}: v_fma_f16 {:#06x} * {:#06x} + {:#06x}", c.m1, c.m2, c.b);
+            assert_eq!(v[base + 2], pk[k], "lane {l} mode {mode:#x}: v_pk_add_f16");
+            assert_eq!(v[base + 3], pk[k], "lane {l} mode {mode:#x}: v_pk_fma_f16");
+            assert_eq!(v[base + 4], mix[k], "lane {l} mode {mode:#x}: v_fma_mixlo_f16");
+            assert_eq!(v[base + 5], c.add[k], "lane {l} mode {mode:#x}: v_sub_f16");
+        }
+    }
+    // OMOD * 2 and CLAMP on lane 0 (1 + 2^-24): 2 + 2^-23 rounds like the sum, the clamp gives 1.0
+    let omod: [u32; 4] = [0x4000, 0x4001, 0x4000, 0x4000];
+    for &(mode, k, base) in &blocks {
+        let base = base as usize;
+        assert_eq!(r.vgpr[0][base + 6], omod[k], "mode {mode:#x}: v_add_f16 omod");
+        assert_eq!(r.vgpr[0][base + 7], 0x3C00, "mode {mode:#x}: v_add_f16 clamp");
+        assert_eq!(r.vgpr[2][base + 7], 0x0000, "mode {mode:#x}: v_add_f16 clamp of a negative sum");
+    }
 }
 
 #[test]

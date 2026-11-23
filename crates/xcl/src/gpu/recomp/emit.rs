@@ -416,7 +416,6 @@ fn is_f16_rounded_op(name: &str) -> bool {
             | "v_min3_f16"
             | "v_max3_f16"
             | "v_frexp_mant_f16"
-            | "v_mad_f16"
             | "v_fmac_f16"
             | "v_fmamk_f16"
             | "v_fmaak_f16"
@@ -443,7 +442,34 @@ fn is_f64_rounded_op(name: &str) -> bool {
     name.contains("_f64")
         && !name.starts_with("v_cmp_")
         && !name.starts_with("v_cmpx_")
-        && !matches!(name, "v_cvt_f32_f64" | "v_cvt_i32_f64" | "v_cvt_u32_f64" | "v_frexp_exp_i32_f64")
+        // exact results (or no f64 result): the rounding mode cannot change them
+        && !matches!(
+            name,
+            "v_cvt_f32_f64"
+                | "v_cvt_i32_f64"
+                | "v_cvt_u32_f64"
+                | "v_cvt_f64_f32"
+                | "v_cvt_f64_i32"
+                | "v_cvt_f64_u32"
+                | "v_frexp_exp_i32_f64"
+                | "v_frexp_mant_f64"
+                | "v_trunc_f64"
+                | "v_floor_f64"
+                | "v_ceil_f64"
+                | "v_rndne_f64"
+                | "v_min_f64"
+                | "v_max_f64"
+        )
+}
+
+/// The factor a VOP3 `OMOD` applies to a float result, as an HLSL literal.
+fn omod_scale(omod: u64) -> &'static str {
+    match omod {
+        1 => "2.0f",
+        2 => "4.0f",
+        3 => "0.5f",
+        _ => "1.0f",
+    }
 }
 
 /// HLSL expression converting float expression `e` to a 16-bit half (`0..=0xFFFF`), rounded in
@@ -2803,6 +2829,10 @@ impl Em {
             let (a, b, c) = (h(0, hi), h(1, hi), h(2, hi));
             let curh = if hi { format!("({cur} >> 16)") } else { format!("({cur} & 0xFFFFu)") };
             Some(match name {
+                // add / fma under MODE[3:2]: rounded once from the f32 result and its error (#111)
+                "v_pk_add_f16" if dyn_rm => format!("add_f16_rm({}, {}, 1.0f, {clamp}, xcl_fp16_rm)", fh(0, hi), fh(1, hi)),
+                "v_pk_fma_f16" if dyn_rm => format!("fma_f16_rm({}, {}, {}, 1.0f, {clamp}, xcl_fp16_rm)", fh(0, hi), fh(1, hi), fh(2, hi)),
+                "v_pk_fmac_f16" if dyn_rm => format!("fma_f16_rm({}, {}, f16tof32({curh}), 1.0f, {clamp}, xcl_fp16_rm)", fh(0, hi), fh(1, hi)),
                 "v_pk_add_f16" => fr(format!("{} + {}", fh(0, hi), fh(1, hi))),
                 "v_pk_mul_f16" => fr(format!("{} * {}", fh(0, hi), fh(1, hi))),
                 "v_pk_fma_f16" => fr(format!("mad({}, {}, {})", fh(0, hi), fh(1, hi), fh(2, hi))),
@@ -2975,6 +3005,8 @@ impl Em {
         };
         let si = |i: usize| format!("(((int)({} << 16)) >> 16)", half(i));
         let dyn_rm = self.dynamic_f16_rm;
+        // add / fma under MODE[3:2]: the f32 result and its rounding error, rounded once (#111)
+        let rm_args = format!("{}, {}, xcl_fp16_rm", omod_scale(m.omod), m.clamp);
         let fr = |e: String| -> String {
             let mut s = match m.omod {
                 1 => format!("(({e}) * 2.0f)"),
@@ -2999,6 +3031,13 @@ impl Em {
         let curh = if plain && m.opsel >> 3 & 1 == 1 { format!("({cur} >> 16)") } else { format!("({cur} & 0xFFFFu)") };
         let (a, b, c) = (half(0), half(1), half(2));
         let r: String = match name {
+            "v_add_f16" if dyn_rm => format!("add_f16_rm({}, {}, {rm_args})", fh(0), fh(1)),
+            "v_sub_f16" if dyn_rm => format!("add_f16_rm({}, -({}), {rm_args})", fh(0), fh(1)),
+            "v_subrev_f16" if dyn_rm => format!("add_f16_rm({}, -({}), {rm_args})", fh(1), fh(0)),
+            "v_fma_f16" if dyn_rm => format!("fma_f16_rm({}, {}, {}, {rm_args})", fh(0), fh(1), fh(2)),
+            "v_fmac_f16" if dyn_rm => format!("fma_f16_rm({}, {}, f16tof32({curh}), {rm_args})", fh(0), fh(1)),
+            "v_fmamk_f16" if dyn_rm => format!("fma_f16_rm({}, f16tof32({} & 0xFFFFu), {}, {rm_args})", fh(0), u[1], fh(2)),
+            "v_fmaak_f16" if dyn_rm => format!("fma_f16_rm({}, {}, f16tof32({} & 0xFFFFu), {rm_args})", fh(0), fh(1), u[2]),
             "v_add_f16" => fr(format!("{} + {}", fh(0), fh(1))),
             "v_sub_f16" => fr(format!("{} - {}", fh(0), fh(1))),
             "v_subrev_f16" => fr(format!("{} - {}", fh(1), fh(0))),
@@ -3018,10 +3057,6 @@ impl Em {
             "v_frexp_mant_f16" => fr(format!("frexp_mant({})", fh(0))),
             "v_frexp_exp_i16_f16" => format!("((uint)frexp_exp({}) & 0xFFFFu)", fh(0)),
             "v_cndmask_b16" => return Err("VALU 16-bit"),
-            "v_mad_f16" => {
-                let rm = if dyn_rm { "xcl_fp16_rm" } else { "0u" };
-                fr(format!("mad_nf_f16({}, {}, {}, {rm})", fh(0), fh(1), fh(2)))
-            }
             "v_fmac_f16" => fr(format!("mad({}, {}, f16tof32({curh}))", fh(0), fh(1))),
             "v_fmamk_f16" => fr(format!("mad({}, f16tof32({} & 0xFFFFu), {})", fh(0), u[1], fh(2))),
             "v_fmaak_f16" => fr(format!("mad({}, {}, f16tof32({} & 0xFFFFu))", fh(0), fh(1), u[2])),
@@ -3359,14 +3394,23 @@ impl Em {
                     }
                     s
                 };
+                let clamp = fv("CLAMP") == 1;
                 let mut e = format!("mad({}, {}, {})", src(0), src(1), src(2));
-                if fv("CLAMP") == 1 {
+                if clamp {
                     e = format!("saturate({e})");
                 }
+                // f16 result under MODE[3:2]: exact product and sum error, rounded once (#111)
+                let h16 = || {
+                    if self.dynamic_f16_rm {
+                        format!("fma_mix_f16_rm({}, {}, {}, {clamp}, xcl_fp16_rm)", src(0), src(1), src(2))
+                    } else {
+                        to_f16_expr(false, &e)
+                    }
+                };
                 match name {
                     "v_fma_mix_f32" => format!("asuint({e})"),
-                    "v_fma_mixlo_f16" => format!("({cur} & 0xFFFF0000u) | {}", to_f16_expr(self.dynamic_f16_rm, &e)),
-                    _ => format!("({cur} & 0xFFFFu) | ({} << 16)", to_f16_expr(self.dynamic_f16_rm, &e)),
+                    "v_fma_mixlo_f16" => format!("({cur} & 0xFFFF0000u) | {}", h16()),
+                    _ => format!("({cur} & 0xFFFFu) | ({} << 16)", h16()),
                 }
             }
             "v_rcp_f32" | "v_rcp_iflag_f32" => fr(format!("rcp({})", fs(0))),
@@ -4307,6 +4351,7 @@ impl Em {
             h.push_str(PRELUDE_SCRATCH);
         }
         if self.dynamic_f16_rm {
+            h.push_str(PRELUDE_F16_RM);
             h.push_str("static uint xcl_fp16_rm = 0u;\n");
         }
         let mut sg: BTreeSet<u64> = self.sgprs.clone();
@@ -5559,6 +5604,104 @@ void xcl_s_barrier() {
     }
     if (WaveReadLaneFirst(_ok) == 0u) xcl_bar_alive = false;
     GroupMemoryBarrier();
+}
+"#;
+
+/// Rounding of binary16 results under `MODE[3:2]`; only in programs that write a non-default
+/// mode and have f16 ops (`Em::dynamic_f16_rm`), so the other programs' HLSL does not change
+/// (`PRELUDE` keeps its plain `f32_to_f16_rm`, which `to_f16_expr` uses, for the same reason:
+/// every program's DXIL cache entry would otherwise be rebuilt once).
+pub(crate) const PRELUDE_F16_RM: &str = r#"
+// IEEE-754 binary32 -> binary16 under RDNA2 MODE[3:2]: 0 = RNE, 1 = +inf, 2 = -inf, 3 = RTZ.
+// `sticky` is the sign of (exact value - f) when f is itself a rounded f32 result (TwoSum's error,
+// add_f16_rm): the exact value then lies strictly between f and its f32 neighbour, so it decides
+// the direction when f sits exactly on a binary16 value or midpoint. 0: f is the exact value.
+uint f32_to_f16_rm_sticky(float f, int sticky, uint rm) {
+    uint x = asuint(f);
+    uint sign = (x >> 16) & 0x8000u;
+    uint ax = x & 0x7FFFFFFFu;
+    if (ax >= 0x7F800000u) return sign | select(ax == 0x7F800000u, 0x7C00u, 0x7E00u | ((ax >> 13) & 0x01FFu));
+    if (ax == 0u) return sign;
+    bool mag_up = (sticky > 0) == (sign == 0u);  // the exact value is larger in magnitude than f
+    bool away = or(and(rm == 1u, sign == 0u), and(rm == 2u, sign != 0u));  // directed: away from zero
+    if (ax >= 0x47800000u) {
+        // 65536 and above: past the midpoint 65520 (that one takes the normal path below), so RNE
+        // overflows whatever the sticky bit says
+        if (rm == 0u) return sign | 0x7C00u;
+        return sign | select(away, 0x7C00u, 0x7BFFu);
+    }
+    if (ax < 0x33800000u) {
+        // below the smallest subnormal (2^-24): 0 or 2^-24, 2^-25 is the midpoint
+        bool inc = select(rm == 0u, or(ax > 0x33000000u, and(ax == 0x33000000u, and(sticky != 0, mag_up))), away);
+        return sign | (uint)inc;
+    }
+    uint h, rem, half_bit;
+    if (ax >= 0x38800000u) {
+        h = (((ax >> 23) - 112u) << 10) | ((ax >> 13) & 0x3FFu);
+        rem = ax & 0x1FFFu;
+        half_bit = 0x1000u;
+    } else {
+        uint sh = 126u - (ax >> 23);
+        uint sig = 0x00800000u | (ax & 0x007FFFFFu);
+        h = sig >> sh;
+        half_bit = 1u << (sh - 1u);
+        rem = sig & ((1u << sh) - 1u);
+    }
+    if (rm == 0u) {
+        bool tie_up = select(sticky == 0, (h & 1u) != 0u, mag_up);
+        return sign | (h + (uint)or(rem > half_bit, and(rem == half_bit, tie_up)));
+    }
+    // directed, f on a binary16 value: an exact value beyond it rounds past it
+    if (rem == 0u) return sign | select(sticky == 0, h, select(mag_up, h + (uint)away, h - (uint)(!away)));
+    return sign | (h + (uint)away);
+}
+// The sign of an exactly zero sum a + b (IEEE 754): -0 from -0 + -0, and under -inf from
+// anything but +0 + +0; +0 otherwise (a cancellation x + -x included)
+float zero_sum(float a, float b, uint rm) {
+    bool pos_a = asuint(a) == 0u, pos_b = asuint(b) == 0u;
+    bool plus = or(and(pos_a, pos_b), and(rm != 2u, or(a != 0.0f, or(pos_a, pos_b))));
+    return asfloat(select(plus, 0u, 0x80000000u));
+}
+// The f32 result of a binary16 operation and the exact error of its rounding (TwoSum), scaled by
+// OMOD, clamped, rounded once to binary16 under rm. The sum of two binary16 values needs up to 41
+// bits, so the f32 sum rounds and its error decides the direction (#111: 1.0 + 2^-24 under +inf
+// gave 1.0 through f32, the console gives 1 + 2^-10).
+uint f16_result_rm(float s, float err, float scale, bool clamp, uint rm) {
+    precise float ss = s * scale;
+    precise float es = err * scale;
+    if (clamp) {
+        if (or(!(ss >= 0.0f), and(ss == 0.0f, es < 0.0f))) { ss = 0.0f; es = 0.0f; }  // negative, NaN
+        else if (or(ss > 1.0f, and(ss == 1.0f, es > 0.0f))) { ss = 1.0f; es = 0.0f; }
+    }
+    return f32_to_f16_rm_sticky(ss, select(es > 0.0f, 1, select(es < 0.0f, -1, 0)), rm);
+}
+uint add_f16_rm(float a, float b, float scale, bool clamp, uint rm) {
+    precise float s = a + b;
+    precise float bb = s - a;
+    precise float err = (a - (s - bb)) + (b - bb);
+    if (s == 0.0f) s = zero_sum(a, b, rm);  // the f32 sum is RNE: its zero's sign ignores the mode
+    return f16_result_rm(s, err, scale, clamp, rm);
+}
+// a * b + c fused: the product of two binary16 values is exact in f32 (22 bits)
+uint fma_f16_rm(float a, float b, float c, float scale, bool clamp, uint rm) { precise float p = a * b; return add_f16_rm(p, c, scale, clamp, rm); }
+// v_fma_mix*_f16 (f32 sources): the product is exact in a double (48 bits), the sum's error comes
+// from a double TwoSum; both fold into the f32 result's sticky bit
+uint fma_mix_f16_rm(float a, float b, float c, bool clamp, uint rm) {
+    precise double p = (double)a * (double)b;
+    precise double cd = (double)c;
+    precise double s = p + cd;
+    precise double bb = s - p;
+    precise double e = (p - (s - bb)) + (cd - bb);
+    if (s == 0.0) return f16_result_rm(zero_sum((float)p, c, rm), 0.0f, 1.0f, clamp, rm);
+    // beyond binary16's range the result depends on the mode alone: the double is brought to a
+    // value f32 holds (2^100 * 2^100 would convert to inf and lose RTZ's 65504; 2^-100 * 2^-100 to 0
+    // and lose +inf's 2^-24), 2^17 and 2^-40 are exact in f32
+    precise double sa = abs(s);
+    if (sa > 131072.0) s = select(s < 0.0, -131072.0, 131072.0);
+    if (sa < 9.094947017729282e-13) s = select(s < 0.0, -9.094947017729282e-13, 9.094947017729282e-13);
+    precise float sf = (float)s;
+    precise double r = (s - (double)sf) + e;
+    return f16_result_rm(sf, select(r > 0.0, 1.0f, select(r < 0.0, -1.0f, 0.0f)), 1.0f, clamp, rm);
 }
 "#;
 
