@@ -709,7 +709,7 @@ fn classify(d: &Decoded, st: &State) -> Option<(Read, Option<(u64, u32)>)> {
 }
 
 /// Successors of each instruction (index); None: unknown (an indirect jump).
-fn successors(insts: &[Decoded], pcs: &BTreeMap<u64, usize>) -> Vec<Option<Vec<usize>>> {
+pub(super) fn successors(insts: &[Decoded], pcs: &BTreeMap<u64, usize>) -> Vec<Option<Vec<usize>>> {
     insts
         .iter()
         .enumerate()
