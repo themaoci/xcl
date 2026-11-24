@@ -8353,6 +8353,109 @@ fn gpu_direct_quad_swizzles() {
     }
 }
 
+#[test]
+fn fma_legacy_hlsl_clears_neg_zero_in_integer_bits() {
+    let code = prog(&[
+        ("V_FMA_LEGACY_F32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+        ("V_FMAC_LEGACY_F32", "ENC_VOP2", &[("VDST", 11), ("SRC0", V), ("VSRC1", 1)], None),
+        ("V_FMAC_LEGACY_F32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V), ("SRC1", V + 1)], None),
+    ]);
+    let t = translate(&code, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
+    assert!(t.hlsl.contains("select(c == 0.0f, 0u, asuint(c))"), "expected bit-level +0 canonicalization:\n{}", t.hlsl);
+    assert!(t.hlsl.contains("fma_legacy(asfloat(v0), asfloat(v1), asfloat(v2))"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("fma_legacy(asfloat(v0), asfloat(v1), asfloat(v11))"), "{}", t.hlsl);
+    if super::dxc::location().is_ok() {
+        super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+    }
+}
+
+/// GPU verification of #679: `v_fma_legacy_f32` and `v_fmac_legacy_f32` treat `±0 * x` (including
+/// `inf` and `NaN`) as `+0.0`, so adding `+0.0` to `-0.0` must yield `+0.0` (`0x0000_0000`), not
+/// `-0.0` (`0x8000_0000`).
+#[test]
+fn gpu_fma_legacy_zero_product_adds_plus_zero() {
+    if !gpu_ready() {
+        return;
+    }
+    let code = prog(&[
+        // v0=+0.0, v1=-0.0, v2=5.0, v3=-5.0, v4=+inf, v5=-inf, v6=qNaN, v7=-3.5, v8=2.25, v9=2.0, v10=10.0
+        ("V_FMA_LEGACY_F32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V), ("SRC1", V + 2), ("SRC2", V + 1)], None),          // +0 * 5 + (-0) = +0
+        ("V_FMA_LEGACY_F32", "ENC_VOP3", &[("VDST", 13), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 1)], None),      // -0 * 5 + (-0) = +0
+        ("V_FMA_LEGACY_F32", "ENC_VOP3", &[("VDST", 14), ("SRC0", V + 3), ("SRC1", V), ("SRC2", V + 1)], None),          // -5 * +0 + (-0) = +0
+        ("V_FMA_LEGACY_F32", "ENC_VOP3", &[("VDST", 15), ("SRC0", V), ("SRC1", V + 4), ("SRC2", V + 1)], None),          // +0 * +inf + (-0) = +0
+        ("V_FMA_LEGACY_F32", "ENC_VOP3", &[("VDST", 16), ("SRC0", V + 1), ("SRC1", V + 5), ("SRC2", V + 1)], None),      // -0 * -inf + (-0) = +0
+        ("V_FMA_LEGACY_F32", "ENC_VOP3", &[("VDST", 17), ("SRC0", V), ("SRC1", V + 6), ("SRC2", V + 1)], None),          // +0 * qNaN + (-0) = +0
+        ("V_FMA_LEGACY_F32", "ENC_VOP3", &[("VDST", 18), ("SRC0", V + 6), ("SRC1", V + 1), ("SRC2", V + 1)], None),      // qNaN * -0 + (-0) = +0
+        ("V_FMA_LEGACY_F32", "ENC_VOP3", &[("VDST", 19), ("SRC0", V), ("SRC1", V + 4), ("SRC2", V + 7)], None),          // +0 * +inf + (-3.5) = -3.5
+        ("V_FMA_LEGACY_F32", "ENC_VOP3", &[("VDST", 20), ("SRC0", V), ("SRC1", V + 6), ("SRC2", V + 8)], None),          // +0 * qNaN + 2.25 = 2.25
+        ("V_FMA_LEGACY_F32", "ENC_VOP3", &[("VDST", 21), ("SRC0", V), ("SRC1", V + 2), ("SRC2", V + 6)], None),          // +0 * 5 + qNaN = NaN
+        ("V_FMA_LEGACY_F32", "ENC_VOP3", &[("VDST", 22), ("SRC0", V + 9), ("SRC1", V + 7), ("SRC2", V + 10)], None),     // 2.0 * -3.5 + 10.0 = 3.0
+        ("V_FMA_LEGACY_F32", "ENC_VOP3", &[("VDST", 23), ("SRC0", V), ("SRC1", V + 4), ("SRC2", V), ("NEG", 4)], None),  // +0 * +inf + (-(+0)) = +0
+        // V_FMAC_LEGACY_F32 (VOP2 and VOP3): dst initialized with addend c
+        ("V_FMAC_LEGACY_F32", "ENC_VOP2", &[("VDST", 24), ("SRC0", V), ("VSRC1", 4)], None),                             // +0 * +inf + (-0) = +0
+        ("V_FMAC_LEGACY_F32", "ENC_VOP2", &[("VDST", 25), ("SRC0", V + 1), ("VSRC1", 2)], None),                         // -0 * 5 + (-0) = +0
+        ("V_FMAC_LEGACY_F32", "ENC_VOP2", &[("VDST", 26), ("SRC0", V), ("VSRC1", 6)], None),                             // +0 * qNaN + (-0) = +0
+        ("V_FMAC_LEGACY_F32", "ENC_VOP2", &[("VDST", 27), ("SRC0", V), ("VSRC1", 4)], None),                             // +0 * +inf + (-3.5) = -3.5
+        ("V_FMAC_LEGACY_F32", "ENC_VOP2", &[("VDST", 28), ("SRC0", V + 9), ("VSRC1", 7)], None),                         // 2.0 * -3.5 + 10.0 = 3.0
+        ("V_FMAC_LEGACY_F32", "ENC_VOP3", &[("VDST", 29), ("SRC0", V), ("SRC1", V + 4)], None),                          // +0 * +inf + (-0) = +0 (VOP3)
+    ]);
+
+    let neg_zero = (-0.0f32).to_bits();
+    let pos_zero = 0.0f32.to_bits();
+    let mut st = KernelState::default();
+    for r in &mut st.vgpr {
+        r[0] = pos_zero;
+        r[1] = neg_zero;
+        r[2] = f(5.0);
+        r[3] = f(-5.0);
+        r[4] = f32::INFINITY.to_bits();
+        r[5] = f32::NEG_INFINITY.to_bits();
+        r[6] = 0x7FC0_0001;
+        r[7] = f(-3.5);
+        r[8] = f(2.25);
+        r[9] = f(2.0);
+        r[10] = f(10.0);
+        r[24] = neg_zero;
+        r[25] = neg_zero;
+        r[26] = neg_zero;
+        r[27] = f(-3.5);
+        r[28] = f(10.0);
+        r[29] = neg_zero;
+    }
+
+    for (wave64, lanes) in [(false, 32usize), (true, 64usize)] {
+        let t = translate(&code, &on_gpu(Options { wave64, ..Default::default() })).unwrap();
+        assert!(t.complete(), "wave64={wave64}: {:?}", t.unsupported_why);
+        let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        let r = runner::run(&dxil, &st, &[]).unwrap();
+        for (l, v) in r.vgpr.iter().enumerate().take(lanes) {
+            for (reg, label) in [
+                (12, "+0 * 5 + (-0)"),
+                (13, "-0 * 5 + (-0)"),
+                (14, "-5 * +0 + (-0)"),
+                (15, "+0 * +inf + (-0)"),
+                (16, "-0 * -inf + (-0)"),
+                (17, "+0 * qNaN + (-0)"),
+                (18, "qNaN * -0 + (-0)"),
+                (23, "+0 * +inf + (- +0)"),
+                (24, "fmac +0 * +inf + (-0)"),
+                (25, "fmac -0 * 5 + (-0)"),
+                (26, "fmac +0 * qNaN + (-0)"),
+                (29, "fmac vop3 +0 * +inf + (-0)"),
+            ] {
+                assert_eq!(v[reg], pos_zero, "wave64={wave64} lane {l} {label}: got {:#010x}", v[reg]);
+            }
+            assert_eq!(v[19], f(-3.5), "wave64={wave64} lane {l} +0 * +inf + (-3.5)");
+            assert_eq!(v[20], f(2.25), "wave64={wave64} lane {l} +0 * qNaN + 2.25");
+            assert!(f32::from_bits(v[21]).is_nan(), "wave64={wave64} lane {l} +0 * 5 + qNaN");
+            assert_eq!(v[22], f(3.0), "wave64={wave64} lane {l} 2.0 * -3.5 + 10.0");
+            assert_eq!(v[27], f(-3.5), "wave64={wave64} lane {l} fmac +0 * +inf + (-3.5)");
+            assert_eq!(v[28], f(3.0), "wave64={wave64} lane {l} fmac 2.0 * -3.5 + 10.0");
+        }
+    }
+}
+
 /// `XCL_SAMPLE_FSPX=<folder>`: every `*.bin` there that is an FSPX (driver) compute container –
 /// e.g. the FSR4 pipelines XCL dumps to `<data>\shaders` – translates and compiles.
 #[test]
