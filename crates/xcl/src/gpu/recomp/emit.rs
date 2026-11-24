@@ -3537,6 +3537,8 @@ impl Em {
             "v_cvt_f32_ubyte1" => fr(format!("(float)(({a} >> 8) & 0xFFu)")),
             "v_cvt_f32_ubyte2" => fr(format!("(float)(({a} >> 16) & 0xFFu)")),
             "v_cvt_f32_ubyte3" => fr(format!("(float)({a} >> 24)")),
+            // signed 4-bit S0[3:0] / 16: -0.5 .. 0.4375 (exact)
+            "v_cvt_off_f32_i4" => fr(format!("(float)(((int)({a} << 28)) >> 28) * 0.0625f")),
             "v_cvt_f32_f16" => {
                 let h = if m.opsel & 1 == 1 { format!("({a} >> 16)") } else { format!("({a} & 0xFFFFu)") };
                 fr(format!("f16tof32({})", Self::sign_mods(&m, 0, &h, 0x8000)))

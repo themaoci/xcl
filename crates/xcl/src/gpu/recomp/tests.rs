@@ -689,6 +689,43 @@ fn cvt_norm_f16_instructions() {
     assert!(t.hlsl.contains("cvt_norm_u16_f16((0x00003C00u & 0xFFFFu))") && t.hlsl.contains("cvt_norm_u16_f16((0x0000BC00u & 0xFFFFu))"), "{}", t.hlsl);
 }
 
+#[test]
+fn v_cvt_off_f32_i4_sign_extends_the_low_nibble() {
+    let code = prog(&[
+        ("V_CVT_OFF_F32_I4", "ENC_VOP1", &[("VDST", 1), ("SRC0", V)], None),
+        ("V_CVT_OFF_F32_I4", "ENC_VOP3", &[("VDST", 2), ("SRC0", V), ("OMOD", 1)], None),
+    ]);
+    let t = translate(&code, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
+    assert!(t.hlsl.contains("(float)(((int)(v0 << 28)) >> 28) * 0.0625f"), "{}", t.hlsl);
+    if super::dxc::location().is_ok() {
+        super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+    }
+}
+
+#[test]
+fn gpu_v_cvt_off_f32_i4() {
+    if !gpu_ready() {
+        return;
+    }
+    let code = prog(&[
+        ("V_CVT_OFF_F32_I4", "ENC_VOP1", &[("VDST", 1), ("SRC0", V)], None),
+        ("V_CVT_OFF_F32_I4", "ENC_VOP3", &[("VDST", 2), ("SRC0", V), ("OMOD", 1)], None), // * 2
+    ]);
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        // nibble = lane % 16; the upper bits must be ignored
+        r[0] = 0xABCD_EF70 | (l as u32 % 16);
+    }
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    for l in 0..64 {
+        let n = (l % 16) as i32;
+        let want = (if n >= 8 { n - 16 } else { n }) as f32 / 16.0;
+        assert_eq!(f32::from_bits(r.vgpr[l][1]), want, "lane {l} nibble {n}");
+        assert_eq!(f32::from_bits(r.vgpr[l][2]), want * 2.0, "lane {l} nibble {n} omod *2");
+    }
+}
+
 /// GPU verification of exact RNE rounding and edge cases for `V_CVT_NORM_*_F16` and
 /// `V_CVT_PKNORM_*_F16`: catches binary32 double-rounding (`0x3801`/`0xB801`), DXIL
 /// `clamp(NaN, -1, 1)` returning ±32767 instead of 0, ±Inf, ±0, subnormals, and VOP3 abs/neg.
