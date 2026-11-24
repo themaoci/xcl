@@ -66,6 +66,7 @@ The shader recompiler preserves branches when several loop exits share a destina
 branch jumps directly into an else block ([#701](https://github.com/ivall/xcl/issues/701)).
 Far-jump address calculations are resolved to fixed targets only when branches enter at the start of the calculation.
 An entry partway through it keeps the jump indirect and subject to the recompiler's existing indirect-branch limits.
+Relative VGPR access accounts for non-sequential image address registers when determining the register range.
 
 ### Media and tools
 

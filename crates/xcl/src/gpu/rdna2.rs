@@ -490,6 +490,16 @@ pub fn vgpr_uses(d: &Decoded) -> (Vec<u64>, Vec<u64>) {
         if f == "VADDR" && matches!(d.enc.name, "ENC_MUBUF" | "ENC_MTBUF") {
             n = field_value(d.enc, &d.words, "IDXEN").unwrap_or(0) + field_value(d.enc, &d.words, "OFFEN").unwrap_or(0);
         }
+        if f == "VADDR" && d.enc.name == "ENC_MIMG" {
+            let nsa = field_value(d.enc, &d.words, "NSA").unwrap_or(0);
+            if let Some(enc) = encoding(&format!("MIMG_NSA{nsa}")) {
+                // Include all encoded addresses conservatively, including padding slots.
+                // The emitter reads these fields instead of a range starting at VADDR.
+                r.extend(enc.fields.iter().filter(|field| field.name.starts_with("VADDR"))
+                    .filter_map(|field| field_value(enc, &d.words, field.name)));
+                continue;
+            }
+        }
         let dst = if o.output { &mut w } else { &mut r };
         dst.extend(v..v + n);
     }
@@ -852,6 +862,35 @@ mod tests {
         resolve_far_jumps(&mut insts);
         assert_eq!(branch_target(&insts[3]), Some(20));
         assert_eq!(branch_target(&insts[7]), None);
+    }
+
+    #[test]
+    fn image_nsa_address_registers_are_not_a_contiguous_range() {
+        for nsa in 1..=3u64 {
+            let mut bytes = encode("IMAGE_SAMPLE", "ENC_MIMG",
+                &[("NSA", nsa), ("VADDR", 4), ("VDATA", 16), ("DMASK", 15)], None).unwrap();
+            let mut registers: Vec<u8> = (0..nsa * 4).map(|i| 100 + i as u8).collect();
+            *registers.last_mut().unwrap() = 255;
+            bytes.extend(&registers);
+            let d = decode(&bytes, 0).unwrap();
+            let (reads, writes) = vgpr_uses(&d);
+            assert!(reads.contains(&4));
+            for &register in &registers {
+                assert!(reads.contains(&(register as u64)), "NSA{nsa} lost v{register}");
+            }
+            assert_eq!(reads.iter().max(), Some(&255));
+            assert!(!reads.contains(&5), "NSA{nsa} invented a sequential address");
+            assert_eq!(writes, vec![16, 17, 18, 19]);
+        }
+    }
+
+    #[test]
+    fn image_sequential_address_registers_keep_the_operand_range() {
+        let bytes = encode("IMAGE_SAMPLE", "ENC_MIMG",
+            &[("VADDR", 4), ("VDATA", 16), ("DMASK", 15)], None).unwrap();
+        let (reads, writes) = vgpr_uses(&decode(&bytes, 0).unwrap());
+        assert_eq!(reads, vec![4, 5, 6]);
+        assert_eq!(writes, vec![16, 17, 18, 19]);
     }
 
     /// Normalise an LLVM mnemonic to the AMD spec name (lower case, no encoding suffix).
