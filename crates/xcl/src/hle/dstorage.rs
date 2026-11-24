@@ -720,6 +720,22 @@ unsafe fn read_own(at: usize, out: *mut u8, len: usize) -> bool {
     at != 0 && ReadProcessMemory(GetCurrentProcess(), at as *const c_void, out as *mut c_void, len, &mut done) != 0 && done == len
 }
 
+#[link(name = "ntdll", kind = "raw-dylib")]
+extern "system" {
+    fn NtWriteVirtualMemory(process: HANDLE, at: *mut c_void, data: *const c_void, len: usize, done: *mut usize) -> i32;
+}
+
+/// `read_own`'s counterpart: write title memory through the process's own handle, so a
+/// destination unmapped after its check fails the request instead of faulting here.
+/// `NtWriteVirtualMemory`, not `WriteProcessMemory`: the latter first queries the region
+/// (`NtQueryVirtualMemory`), which walks the page tables of the whole committed range – 75–175 ms
+/// a call in the 4 GiB coherent window, measured, and the title's first streaming stalled.
+unsafe fn write_own(at: usize, data: &[u8]) -> bool {
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut done = 0usize;
+    at != 0 && NtWriteVirtualMemory(GetCurrentProcess(), at as *mut c_void, data.as_ptr() as *const c_void, data.len(), &mut done) >= 0 && done == data.len()
+}
+
 /// Whether `n` bytes at `p` are committed, writable memory.
 fn writable(p: usize, n: usize) -> bool {
     let Some(end) = p.checked_add(n) else { return false };
@@ -849,7 +865,11 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
             return Err(E_ACCESS_VIOLATION);
         }
     } else if n > 0 {
-        std::ptr::copy_nonoverlapping(payload.as_ptr(), r.destination as *mut u8, n);
+        // checked writable at the start, but the file read and the inflate ran since: the title
+        // may have unmapped it meanwhile
+        if !write_own(r.destination as usize, &payload[..n]) {
+            return Err(E_ACCESS_VIOLATION);
+        }
     }
     Ok(())
 }
@@ -1954,6 +1974,75 @@ mod tests {
             MapTitlePhysicalPages(reserved, 2, 0, 4, std::ptr::null_mut());
             windows_sys::Win32::System::Memory::VirtualFree(reserved, 0, windows_sys::Win32::System::Memory::MEM_RELEASE);
             assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 2, pages.as_mut_ptr()), 1);
+            queue_close(q);
+            queue_release(q);
+            status_release(s);
+        }
+    }
+
+    /// A request whose virtual destination the title decommits after the check at the start of
+    /// `execute` and before the data is written: the request fails (E_ACCESS_VIOLATION) and the
+    /// worker never faults, whatever the destination's state at that moment.
+    #[test]
+    fn a_destination_unmapped_under_the_worker_fails_the_request() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        const REQUESTS: u32 = 20_000;
+        unsafe {
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut f), S_OK);
+            let vt = *(f as *const *const usize);
+            let create_queue: unsafe extern "system" fn(*mut c_void, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(3));
+            let create_status: unsafe extern "system" fn(*mut c_void, u32, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(5));
+            let mut desc = [0u8; 0x18];
+            desc[0..4].copy_from_slice(&1u32.to_le_bytes());
+            desc[8..10].copy_from_slice(&64u16.to_le_bytes());
+            desc[10] = 2;
+            let mut q = std::ptr::null_mut();
+            assert_eq!(create_queue(f, desc.as_ptr(), &IID_QUEUE, &mut q), S_OK);
+            let mut s = std::ptr::null_mut();
+            assert_eq!(create_status(f, 1, std::ptr::null(), &IID_STATUS_ARRAY, &mut s), S_OK);
+            let qv = *(q as *const *const usize);
+            let enqueue: unsafe extern "system" fn(*mut c_void, *const u8) = std::mem::transmute(*qv.add(3));
+            let status: unsafe extern "system" fn(*mut c_void, *mut c_void, u32) = std::mem::transmute(*qv.add(4));
+            let submit: unsafe extern "system" fn(*mut c_void) = std::mem::transmute(*qv.add(6));
+            let sv = *(s as *const *const usize);
+            let complete: unsafe extern "system" fn(*mut c_void, u32) -> bool = std::mem::transmute(*sv.add(3));
+            let hresult: unsafe extern "system" fn(*mut c_void, u32) -> HRESULT = std::mem::transmute(*sv.add(4));
+
+            // the destination: a page of the title's that it frees and reuses meanwhile
+            let dest = VirtualAlloc(std::ptr::null(), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            assert_ne!(dest, 0);
+            let data = [0x5Au8; 16];
+            let stop = std::sync::Arc::new(AtomicBool::new(false));
+            let toggler = {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        VirtualFree(dest as *mut c_void, 0x1000, MEM_DECOMMIT);
+                        VirtualAlloc(dest as *const c_void, 0x1000, MEM_COMMIT, PAGE_READWRITE);
+                    }
+                })
+            };
+            for i in 0..REQUESTS {
+                enqueue(q, request(SOURCE_MEMORY_BIT, dest as u64, 16, data.as_ptr() as u64, 0, 16).as_ptr());
+                if i % 16 == 15 {
+                    submit(q);
+                }
+            }
+            status(q, s, 0);
+            submit(q);
+            let t = std::time::Instant::now();
+            while !complete(s, 0) && t.elapsed().as_secs() < 60 {
+                std::thread::yield_now();
+            }
+            stop.store(true, Ordering::Relaxed);
+            toggler.join().unwrap();
+            assert!(complete(s, 0), "the queue did not get through its requests");
+            // each request either wrote the page or failed: nothing else
+            assert!(matches!(hresult(s, 0), S_OK | E_ACCESS_VIOLATION), "{:#x}", hresult(s, 0));
+
+            VirtualFree(dest as *mut c_void, 0, MEM_RELEASE);
             queue_close(q);
             queue_release(q);
             status_release(s);
