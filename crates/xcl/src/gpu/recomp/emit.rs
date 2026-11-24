@@ -3031,6 +3031,11 @@ impl Em {
             "v_sqrt_f16" => fr(format!("sqrt({})", fh(0))),
             "v_log_f16" => fr(format!("log2({})", fh(0))),
             "v_exp_f16" => fr(format!("exp2({})", fh(0))),
+            // ±Inf gives the f16 NaN 0xFE00 on RDNA2 (ivall/xcl#796); f32tof16 of the f32 NaN may not.
+            "v_sin_f16" | "v_cos_f16" if !m.clamp => {
+                let f = if name == "v_sin_f16" { "sin_turns" } else { "cos_turns" };
+                format!("select(({} & 0x7FFFu) == 0x7C00u, 0xFE00u, {})", hb(0), fr(format!("{f}({})", fh(0))))
+            }
             "v_sin_f16" => fr(format!("sin_turns({})", fh(0))),
             "v_cos_f16" => fr(format!("cos_turns({})", fh(0))),
             // fract_f clamps below 1.0 in binary32, but 1 - 2^-24 narrows to 1.0 in binary16 by

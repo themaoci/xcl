@@ -1235,6 +1235,9 @@ fn gpu_abs_neg_on_move_select_and_conversions() {
 /// v_sin / v_cos take turns and reduce them exactly: every functional example the RDNA 2 ISA
 /// prints for V_SIN_F32 / V_COS_F32 (p.142) and V_SIN_F16 / V_COS_F16 (p.149), exact zeros at
 /// whole, half and quarter turns, and large arguments that keep their phase (2π·(x - trunc(x))).
+/// Rows marked `hw` are native RDNA2 results (RX 6800M, gfx1031), measured by luckyteagirl in
+/// https://github.com/ivall/xcl/issues/796#issuecomment-7123464342. Where the hardware value comes
+/// from its own sine approximation (0.125 turns), `Ulps` allows one ulp, as the driver's sin() differs.
 #[test]
 fn gpu_sin_cos_reduce_in_turns() {
     if !gpu_ready() {
@@ -1245,6 +1248,7 @@ fn gpu_sin_cos_reduce_in_turns() {
         Bits(u32),
         Nan,
         Near(f64),
+        Ulps(u32, u32),
     }
     use E::*;
     let turn = |x: f64, f: fn(f64) -> f64| f(2.0 * std::f64::consts::PI * (x - x.trunc()));
@@ -1252,21 +1256,25 @@ fn gpu_sin_cos_reduce_in_turns() {
     // (input, sin, cos)
     let mut c32: Vec<(u32, E, E)> = vec![
         // the ISA's examples
-        (0xFF80_0000, Nan, Nan),
-        (0xFF7F_FFFF, Bits(0), Bits(0x3F80_0000)),
-        (0x8000_0000, Bits(0x8000_0000), Bits(0x3F80_0000)),
-        (0x3E80_0000, Bits(0x3F80_0000), Bits(0)),
-        (0x7F80_0000, Nan, Nan),
-        (0x7FC0_1234, Nan, Nan), // a NaN stays NaN
-        // +MaxFloat, and exact zeros at half and quarter turns
-        (0x7F7F_FFFF, Bits(0), Bits(0x3F80_0000)),
-        (f(0.5), Bits(0), Near(-1.0)),
-        (f(-0.75), Near(1.0), Bits(0)),
+        (0xFF80_0000, Bits(0xFFC0_0000), Bits(0xFFC0_0000)), // hw
+        (0xFF7F_FFFF, Bits(0), Bits(0x3F80_0000)),           // hw
+        (0x8000_0000, Bits(0x8000_0000), Bits(0x3F80_0000)), // hw
+        (0x3E80_0000, Bits(0x3F80_0000), Bits(0)),           // hw
+        (0x7F80_0000, Bits(0xFFC0_0000), Bits(0xFFC0_0000)), // hw
+        (0x7FC0_1234, Nan, Nan),                             // a NaN stays NaN
+        (0x7F7F_FFFF, Bits(0), Bits(0x3F80_0000)),           // hw, +MaxFloat
+        // exact zeros and ones at half and quarter turns
+        (f(0.5), Bits(0), Bits(0xBF80_0000)),       // hw
+        (f(-0.75), Bits(0x3F80_0000), Bits(0)),     // hw
+        (f(8388607.5), Bits(0), Bits(0xBF80_0000)), // hw
         (f(12345.5), Bits(0), Near(-1.0)),
         (f(7.25), Near(1.0), Bits(0)),
-        (f(8388607.5), Bits(0), Near(-1.0)),
     ];
-    for x in [0.1f32, -3.3, 255.125, 100000.125, 1000000.125, -2097151.875] {
+    // hw: an eighth of a turn gives the same bits at every whole-turn offset
+    for x in [0.125f32, 255.125, 100000.125, 1000000.125] {
+        c32.push((f(x), Ulps(0x3F35_04F4, 1), Ulps(0x3F35_04F3, 1)));
+    }
+    for x in [0.1f32, -3.3, -2097151.875] {
         let (s, c) = near(x);
         c32.push((f(x), s, c));
     }
@@ -1275,16 +1283,17 @@ fn gpu_sin_cos_reduce_in_turns() {
         s * if e == 0 { m * 2f64.powi(-24) } else { (1.0 + m / 1024.0) * 2f64.powi(e as i32 - 15) }
     };
     let c16: Vec<(u32, E, E)> = vec![
-        (0xFC00, Nan, Nan),
-        (0xFBFF, Bits(0), Bits(0x3C00)),
-        (0x8000, Bits(0x8000), Bits(0x3C00)),
+        (0xFC00, Bits(0xFE00), Bits(0xFE00)),       // hw
+        (0xFBFF, Bits(0), Bits(0x3C00)),            // hw, -65504
+        (0x8000, Bits(0x8000), Bits(0x3C00)),       // hw
         (0x3400, Bits(0x3C00), Bits(0)),
-        (0x7BFF, Bits(0), Bits(0x3C00)),
-        (0x7C00, Nan, Nan),
+        (0x7BFF, Bits(0), Bits(0x3C00)),            // hw, +65504
+        (0x7C00, Bits(0xFE00), Bits(0xFE00)),       // hw
         (0x7E01, Nan, Nan),
-        (0x5BF8, Bits(0), Bits(0x3C00)),                               // 255 turns
-        (0x3800, Bits(0), Near(-1.0)),                                 // half a turn
-        (0x5BF9, Near(turn(255.125, f64::sin)), Near(turn(255.125, f64::cos))),
+        (0x5BF8, Bits(0), Bits(0x3C00)),            // hw, 255 turns
+        (0x3800, Bits(0), Near(-1.0)),              // half a turn
+        (0x3000, Ulps(0x39A8, 1), Ulps(0x39A8, 1)), // hw, 0.125 turns
+        (0x5BF9, Ulps(0x39A8, 1), Ulps(0x39A8, 1)), // hw, 255.125 turns
         (0xD640, Near(turn(-100.0, f64::sin)), Near(turn(-100.0, f64::cos))), // -100
     ];
     let p = prog(&[
@@ -1305,6 +1314,7 @@ fn gpu_sin_cos_reduce_in_turns() {
             Bits(b) => got == b,
             Nan => is_nan,
             Near(v) => (value - v).abs() <= tol,
+            Ulps(b, n) => (got as i64 - b as i64).abs() <= n as i64,
         };
         if !ok {
             bad.push(format!("{name}({x:#X}) = {got:#X} ({value}), want {want:?}"));
