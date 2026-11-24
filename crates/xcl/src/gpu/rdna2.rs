@@ -419,10 +419,9 @@ pub fn encoding(name: &str) -> Option<&'static Encoding> {
     ENCODINGS.iter().find(|e| e.name == name)
 }
 
-/// VGPRs an instruction reads and writes (explicit operands; register ranges by operand
-/// size). SDWA/DPP src0 comes from the extension dword.
 /// SGPRs (codes 0–127 without NULL: s0–s105, VCC, M0, EXEC…) read and written by the
-/// explicit operands: (reads, writes).
+/// explicit operands: (reads, writes). An SDWA instruction's are in its extension dword too:
+/// a source whose S bit is set, and the SGPR pair a compare writes instead of VCC (SD).
 pub fn sgpr_uses(d: &Decoded) -> (Vec<u64>, Vec<u64>) {
     let (mut r, mut w) = (Vec::new(), Vec::new());
     for o in d.ienc.operands {
@@ -445,9 +444,22 @@ pub fn sgpr_uses(d: &Decoded) -> (Vec<u64>, Vec<u64>) {
         let dst = if o.output { &mut w } else { &mut r };
         dst.extend(v..(v + n).min(128));
     }
+    if d.variant == Variant::Sdwa {
+        let ext = d.words.get(1).copied().unwrap_or(0);
+        let src1 = field_value(d.enc, &d.words, "VSRC1").filter(|_| ext >> 31 & 1 == 1);
+        r.extend(Some((ext & 0xff) as u64).filter(|_| ext >> 23 & 1 == 1).into_iter().chain(src1).filter(|&v| v <= 127 && v != 125));
+        // SDST (bits 8-14 of the dword): a mask, two SGPRs as a VOP3 compare's; v_cmpx writes EXEC
+        let sdst = (ext >> 8 & 0x7f) as u64;
+        if d.enc.name == "ENC_VOPC" && ext >> 15 & 1 == 1 && !d.inst.name.starts_with("V_CMPX") && sdst != 125 {
+            w.extend(sdst..(sdst + 2).min(128));
+        }
+    }
     (r, w)
 }
 
+/// VGPRs an instruction reads and writes (explicit operands; register ranges by operand
+/// size). SDWA/DPP src0 comes from the extension dword, and an SDWA source whose S bit is set
+/// is no VGPR.
 pub fn vgpr_uses(d: &Decoded) -> (Vec<u64>, Vec<u64>) {
     let (mut r, mut w) = (Vec::new(), Vec::new());
     for o in d.ienc.operands {
@@ -457,7 +469,9 @@ pub fn vgpr_uses(d: &Decoded) -> (Vec<u64>, Vec<u64>) {
         }
         let Some(mut v) = field_value(d.enc, &d.words, f) else { continue };
         let width = d.enc.field_width(f);
-        let vgpr = if o.ty.starts_with("OPR_VGPR") && width <= 8 {
+        let vgpr = if f == "VSRC1" && d.variant == Variant::Sdwa && d.words.get(1).copied().unwrap_or(0) >> 31 & 1 == 1 {
+            false
+        } else if o.ty.starts_with("OPR_VGPR") && width <= 8 {
             true
         } else if width >= 9 && (o.ty.starts_with("OPR_SRC") || o.ty.starts_with("OPR_VGPR")) && v >= 256 {
             v -= 256;
@@ -693,6 +707,29 @@ mod tests {
         // SBASE counts SGPR pairs, SRSRC SGPR quads (seen in retail code)
         assert_eq!(dis(&[0x08, 0x02, 0x08, 0xf4, 0x20, 0x09, 0x00, 0xfa]), "s_load_dwordx4 s[8:11], s[16:17], 0x920");
         assert_eq!(dis(&[0x04, 0x02, 0x28, 0xf4, 0x40, 0x00, 0x00, 0xfa]), "s_buffer_load_dwordx4 s[8:11], s[8:11], 0x40");
+    }
+
+    #[test]
+    fn sdwa_register_uses_come_from_the_extension_dword() {
+        let uses = |words: [u32; 2]| {
+            let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let d = decode(&bytes, 0).unwrap();
+            assert_eq!(d.variant, Variant::Sdwa);
+            (sgpr_uses(&d), vgpr_uses(&d))
+        };
+        // v_cmp_lt_f32_sdwa s5, v1, s2: reads v1 and s2, writes the mask to s[5:6]
+        assert_eq!(uses([0x7c02_04f9, 0x8606_8501]), ((vec![2], vec![5, 6]), (vec![1], vec![])));
+        // v_cmp_lt_f32_sdwa v1, v2 (no SD: VCC, implicit as in the plain form)
+        assert_eq!(uses([0x7c02_04f9, 0x0606_0001]), ((vec![], vec![]), (vec![1, 2], vec![])));
+        // v_cmpx_lt_f32_sdwa v1, v2 with the SD bits set: EXEC, no SGPR
+        assert_eq!(uses([0x7c22_04f9, 0x0606_8501]), ((vec![], vec![]), (vec![1, 2], vec![])));
+        // v_lshlrev_b32_sdwa v5, s1, s2
+        assert_eq!(uses([0x340a_04f9, 0x8686_0601]), ((vec![1, 2], vec![]), (vec![], vec![5])));
+        // v_lshlrev_b32_sdwa v5, 1.0, v2 (S0 with an inline constant: no register) and v5, v1, v2
+        assert_eq!(uses([0x340a_04f9, 0x0686_06f2]), ((vec![], vec![]), (vec![2], vec![5])));
+        assert_eq!(uses([0x340a_04f9, 0x0606_0601]), ((vec![], vec![]), (vec![1, 2], vec![5])));
+        // v_mov_b32_sdwa v1, s2
+        assert_eq!(uses([0x7e02_02f9, 0x0086_0602]), ((vec![2], vec![]), (vec![], vec![1])));
     }
 
     #[test]

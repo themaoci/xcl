@@ -88,6 +88,39 @@ fn f(x: f32) -> u32 {
     x.to_bits()
 }
 
+/// What `rdna2::sgpr_uses` reports for an SDWA compare into an SGPR reaches its callers: the
+/// mask it writes is a mask to `geometry_wave32_hazards`, and a constant it overwrites is no
+/// longer a word of a static sampler.
+#[test]
+fn sdwa_compare_destination_is_a_write_to_the_analyses() {
+    let one = |name: &str, enc: &str, fields: &[(&str, u64)]| encode(name, enc, fields, None).unwrap();
+    // v_cmp_lt_f32_sdwa s<n>, v1, v2
+    let compare = |sdst: u32| [0x7c02_04f9u32, 0x0606_8001 | sdst << 8].iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>();
+
+    let mut count = compare(10);
+    count.extend(one("S_BCNT1_I32_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 10)]));
+    assert!(super::geometry_wave32_hazards(&count).contains("whole-wave mask reduction"));
+
+    // s[8:11] = 1, 2, 3, 4; image_sample with them as its sampler; the same after s9 was written
+    let mut code = Vec::new();
+    for r in 8..12 {
+        code.extend(one("S_MOVK_I32", "ENC_SOPK", &[("SDST", r), ("SIMM16", r - 7)]));
+    }
+    let sample = one("IMAGE_SAMPLE", "ENC_MIMG", &[("DMASK", 15), ("VADDR", 0), ("VDATA", 4), ("SRSRC", 0), ("SSAMP", 2)]);
+    code.extend(&sample);
+    code.extend(compare(9));
+    code.extend(&sample);
+    let (mut insts, mut off) = (Vec::new(), 0);
+    while off < code.len() {
+        let d = crate::gpu::rdna2::decode(&code[off..], off as u64).unwrap();
+        off += d.len;
+        insts.push(d);
+    }
+    assert_eq!((insts[4].inst.name, insts[5].inst.name, insts[6].inst.name), ("IMAGE_SAMPLE", "V_CMP_LT_F32", "IMAGE_SAMPLE"));
+    let samplers = super::constant_samplers(&insts, &Default::default());
+    assert_eq!(samplers.into_iter().collect::<Vec<_>>(), [(insts[4].pc, [1, 2, 3, 4])]);
+}
+
 #[test]
 fn geometry_wave32_rejects_cross_half_operations() {
     let one = |name: &str, enc: &str, fields: &[(&str, u64)]| encode(name, enc, fields, None).unwrap();
