@@ -40,8 +40,7 @@ whole-wave:
 |---|---|
 | `ballot()` (every mask: `v_cmp*`, `v_cmpx*`, carries, EXEC at entry) | one word: each half gives its 32-bit ballot, both get the 64-bit mask – unless the mask is only read lane by lane (below) |
 | `v_readlane`, `v_readfirstlane` (lane index uniform) | one word: each half gives the value of lane `l & 31`, the half that owns `l` wins |
-| `ds_bpermute` (any lane) | 32 words: each half gives its lanes |
-| DPP16, DPP8, `ds_swizzle`, `v_permlane(x)16` | none: the ISA keeps them inside a 32-lane half (`WaveReadLaneAt(v, l & 31)`) |
+| DPP16, DPP8, `ds_swizzle`, `ds_bpermute`, `v_permlane(x)16` | none: they stay inside a 32-lane half (`WaveReadLaneAt(v, l & 31)`); for `ds_bpermute`, lane l reads `(l & 32) \| (index & 31)`, measured on RDNA2 in native wave64 (#772) |
 | `s_load*` / `s_buffer_load*` with GLC (or DLC) | up to 16 words: half 0's values for both (memory another wave writes may change between the two halves' loads; without GLC the console's scalar cache is not coherent either, so plain loads are read by both halves) |
 
 So both halves hold the full 64-bit EXEC / VCC / masks and identical SGPRs; every branch is
@@ -79,7 +78,7 @@ GS phase of ES+GS runs in the lower half only (≤ 21 primitives), likewise with
 ### Memory
 
 The exchange needs groupshared space: per console wave 2 counters + 2 halves × 2 parities ×
-slot (1 word, 16 with wide GLC scalar loads, 32 with `ds_bpermute`). Without console LDS it
+slot (1 word, 16 with wide GLC scalar loads). Without console LDS it
 has arrays of its own; with LDS (`xcl_lds`, already the full 32 KB D3D12 limit) it lives in
 the top of the LDS block (as PR #33 did), and the program's LDS accesses are clamped below
 it. A program that really uses the whole 32 KB of LDS therefore loses its top dwords on a
@@ -139,7 +138,7 @@ destination, 0 in every lane), which are the same in both halves either way.
 
 A wave64 program pays one exchange per mask write that is read whole (`v_cmp*` feeding
 `s_and_saveexec`, `s_cbranch_vccz`, `s_bcnt1`, …) and per readlane / readfirstlane /
-ds_bpermute / coherent scalar load, nothing per ALU, memory or DPP instruction, nor for
+coherent scalar load, nothing per ALU, memory or DPP instruction, nor for
 masks read lane by lane (selects, 64-bit carry chains). Wave32 programs and everything on GPUs with 64-lane waves are
 unchanged (the HLSL of every native translation the test suite makes is byte-identical). A
 wave64 VS / PS pays nothing for a lane ≥ 32 read as a constant (the lane read is skipped) and
@@ -179,7 +178,7 @@ the split form (64-bit masks, the threads' start), not measured further. The ben
 loop mask is exactly the kind the pass keeps local – it shows the exchange gone and what
 one costs, not how often real shaders gain.
 
-What is left is readlane / readfirstlane, `ds_bpermute`, coherent scalar loads and masks
+What is left is readlane / readfirstlane, coherent scalar loads and masks
 read whole. Not measured on real compute shaders (none on that machine); Minecraft's 273
 wave64 programs, translated as compute, have 38 mask writes, all only read lane by lane.
 
@@ -190,8 +189,8 @@ GPU with 32-lane waves only a console wave64 VS / PS runs in waves of 32. Nothin
 them (no groupshared memory), so such a wave stands for a console wave whose lanes 32..63 are
 not populated, as in the last, partial wave of a draw. Per-lane code is exact as it is, and so
 are masks (their upper word is 0: those lanes are inactive), DPP / `ds_swizzle` /
-`v_permlane(x)16` (inside a 32-lane half) and `v_readfirstlane`. What is not: a read of a lane
-≥ 32 – `v_readlane` with a constant lane ≥ 32 or a lane from an SGPR, `ds_bpermute` – and
+`ds_bpermute` / `v_permlane(x)16` (inside a 32-lane half) and `v_readfirstlane`. What is not:
+a read of a lane ≥ 32 – `v_readlane` with a constant lane ≥ 32 or a lane from an SGPR – and
 `v_writelane` to one. On the console those lanes exist, inactive, and hold what `v_writelane`
 (which ignores EXEC) or whole-wave code (EXEC's upper word set, `s_or_saveexec_b64 s, -1`)
 put there; here they do not exist, and `WaveReadLaneAt(v, l)` with l ≥ 32 is undefined (NVIDIA

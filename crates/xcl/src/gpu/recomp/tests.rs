@@ -2976,7 +2976,7 @@ fn gpu_format_stores_atomics_global_lds() {
         if l < 63 {
             assert_eq!(v[25], l as u32 + 1, "lane {l} ds_read2 (second; LDS is not zeroed past the written area)");
         }
-        assert_eq!(v[29], 63 - l as u32, "lane {l} ds_bpermute");
+        assert_eq!(v[29], l as u32 ^ 31, "lane {l} ds_bpermute (index 63 - l, within its half)");
         assert!(v[16] < 164, "lane {l} umax old value");
     }
     assert_eq!(r.mem[0x400 / 4], 64, "buffer_atomic_add");
@@ -6092,10 +6092,73 @@ fn mesh_split_wave64_form() {
     assert!(super::translate_mesh(&lane, ms, true, true, 1).unwrap().hlsl.contains("xcl_x_rla_uniform("));
 }
 
+/// ds_bpermute_b32 in wave64 reads within each 32-lane half: lane l reads lane
+/// `(l & 32) | (((addr + offset) >> 2) & 31)`, and 0 where that lane is inactive. Measured on
+/// RDNA2 in native wave64: the three full-EXEC indices on an RX 6800M (gfx1031) by
+/// luckyteagirl, https://github.com/ivall/xcl/issues/772#issuecomment-7123462950, and the
+/// immediate offsets and the partial EXEC on gfx1036 by certified-retart,
+/// https://github.com/ivall/xcl/issues/772#issuecomment-7127381205. The same results natively
+/// (64-lane waves) and split (32-lane waves only).
+#[test]
+fn gpu_ds_bpermute_wave64_stays_in_its_half() {
+    if !gpu_ready() {
+        return;
+    }
+    let code = prog(&[
+        ("DS_BPERMUTE_B32", "ENC_DS", &[("VDST", 10), ("ADDR", 1), ("DATA0", 0)], None), // lane
+        ("DS_BPERMUTE_B32", "ENC_DS", &[("VDST", 11), ("ADDR", 2), ("DATA0", 0)], None), // 63 - lane
+        ("DS_BPERMUTE_B32", "ENC_DS", &[("VDST", 12), ("ADDR", 3), ("DATA0", 0)], None), // (lane + 1) & 63
+        ("DS_BPERMUTE_B32", "ENC_DS", &[("VDST", 13), ("ADDR", 1), ("DATA0", 0), ("OFFSET0", 4)], None),
+        ("DS_BPERMUTE_B32", "ENC_DS", &[("VDST", 14), ("ADDR", 1), ("DATA0", 0), ("OFFSET0", 128)], None),
+        ("DS_BPERMUTE_B32", "ENC_DS", &[("VDST", 15), ("ADDR", 2), ("DATA0", 0), ("OFFSET0", 4)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 255)], Some(0x5555_5555)),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 127), ("SSRC0", 255)], Some(0xAAAA_AAAA)),
+        ("DS_BPERMUTE_B32", "ENC_DS", &[("VDST", 16), ("ADDR", 4), ("DATA0", 0)], None), // lane ^ 32
+    ]);
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let l = l as u32;
+        r[0] = 1000 + l; // a 0 from an inactive lane stays apart from lane 0
+        r[1] = 4 * l;
+        r[2] = 4 * (63 - l);
+        r[3] = 4 * ((l + 1) & 63);
+        r[4] = 4 * (l ^ 32);
+        r[16] = 0xCAFE_BABE;
+    }
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    let half = |l: u32, addr: u32, off: u32| 1000 + ((l & 32) | ((addr + off) >> 2 & 31));
+    let mut bad = Vec::new();
+    for l in 0..64u32 {
+        let v = &r.vgpr[l as usize];
+        let exec = if l < 32 { 0x5555_5555u32 >> l & 1 } else { 0xAAAA_AAAAu32 >> (l - 32) & 1 };
+        // the source lane (l & 32) | (l & 31) = l is active exactly when l is
+        let partial = if exec == 1 { half(l, 4 * (l ^ 32), 0) } else { 0xCAFE_BABE };
+        for (what, got, want) in [
+            ("4 * lane", v[10], half(l, 4 * l, 0)),
+            ("4 * (63 - lane)", v[11], half(l, 4 * (63 - l), 0)),
+            ("4 * ((lane + 1) & 63)", v[12], half(l, 4 * ((l + 1) & 63), 0)),
+            ("4 * lane, offset:4", v[13], half(l, 4 * l, 4)),
+            ("4 * lane, offset:128", v[14], half(l, 4 * l, 128)),
+            ("4 * (63 - lane), offset:4", v[15], half(l, 4 * (63 - l), 4)),
+            ("4 * (lane ^ 32), exec 0xAAAAAAAA_55555555", v[16], partial),
+        ] {
+            if got != want {
+                bad.push(format!("lane {l} {what}: {got}, want {want}"));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{} wrong:
+{}", bad.len(), bad.join("
+"));
+    // the measured lanes quoted on #772
+    assert_eq!([r.vgpr[0][11], r.vgpr[32][11], r.vgpr[63][11]], [1031, 1063, 1032], "63 - lane: lanes 0, 32, 63");
+    assert_eq!([r.vgpr[31][12], r.vgpr[63][12]], [1000, 1032], "(lane + 1) & 63: lanes 31, 63");
+}
+
 /// Operations whose result spans both 32-lane halves of a wave64 – what the split form
 /// exchanges: masks with bits in either half (counted, scanned, branched on), readlane /
-/// readfirstlane of a lane in the other half, ds_bpermute across the halves, a GLC scalar
-/// load. The same results natively (64-lane waves) and split (32-lane waves only); split,
+/// readfirstlane of a lane in the other half, a GLC scalar load – and ds_bpermute, which
+/// stays in its half (#772). The same results natively (64-lane waves) and split (32-lane waves only); split,
 /// the runner also checks both halves end with the same SGPRs.
 #[test]
 fn gpu_split_wave64_cross_half_operations() {
@@ -6115,7 +6178,7 @@ fn gpu_split_wave64_cross_half_operations() {
         ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 1)], None), // not taken: only the upper half is active
         ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 3)], None),
         ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 193)], None),
-        ("DS_BPERMUTE_B32", "ENC_DS", &[("VDST", 6), ("ADDR", 4), ("DATA0", 1)], None), // lane 63 - l
+        ("DS_BPERMUTE_B32", "ENC_DS", &[("VDST", 6), ("ADDR", 4), ("DATA0", 1)], None), // index 63 - l: lane l ^ 31
         ("V_CMP_EQ_U32", "ENC_VOPC", &[("SRC0", 255), ("VSRC1", 0)], Some(50)), // vcc = lane 50 only
         ("S_CBRANCH_VCCZ", "ENC_SOPP", &[("SIMM16", 1)], None), // not taken
         ("S_MOV_B32", "ENC_SOP1", &[("SDST", 5), ("SSRC0", 129)], None),
@@ -6146,7 +6209,7 @@ fn gpu_split_wave64_cross_half_operations() {
         let v = &r.vgpr[l];
         assert_eq!(v[5], (l as u32).min(40), "lane {l}: v_mbcnt over vcc");
         assert_eq!(v[2], if l >= 48 { 1048 } else { 0x77 }, "lane {l}: write under exec of the upper half");
-        assert_eq!(v[6], 1000 + 63 - l as u32, "lane {l}: ds_bpermute from lane {}", 63 - l);
+        assert_eq!(v[6], 1000 + (l as u32 ^ 31), "lane {l}: ds_bpermute of index {} from lane {}", 63 - l, l ^ 31);
     }
 }
 
@@ -6384,8 +6447,8 @@ fn gpu_split_wave64_local_and_exchanged_masks_in_diverging_waves() {
 }
 
 /// A group of four wave64s whose waves take different paths: each loops 2 · (wave + 1)
-/// times through a ballot, s_bcnt1 and a readlane, then exchanges lanes across its halves
-/// with ds_bpermute. Split (32-lane GPUs) this is the counter-paired form – a group barrier
+/// times through a ballot, s_bcnt1 and a readlane, then exchanges lanes with ds_bpermute
+/// (index lane ^ 33, which stays in its half: lane ^ 1). Split (32-lane GPUs) this is the counter-paired form – a group barrier
 /// per exchange would deadlock or mix the waves up. 3-D groups too: NVIDIA does not form its
 /// waves from consecutive thread indices there (8 × 8 × 4), the console does.
 #[test]
@@ -6418,7 +6481,7 @@ fn gpu_split_wave64_waves_diverge() {
         ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFF5)], None), // → loop
         ("V_XOR_B32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 255), ("VSRC1", 2)], Some(33)),
         ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 130), ("VSRC1", 3)], None),
-        ("DS_BPERMUTE_B32", "ENC_DS", &[("VDST", 6), ("ADDR", 3), ("DATA0", 0)], None), // v0 of lane ^ 33
+        ("DS_BPERMUTE_B32", "ENC_DS", &[("VDST", 6), ("ADDR", 3), ("DATA0", 0)], None), // index lane ^ 33: v0 of lane ^ 1
         ("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 11)], None),
         ("S_LSHL_B32", "ENC_SOP2", &[("SDST", 16), ("SSRC0", 4), ("SSRC1", 136)], None), // group · 256
         ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 7), ("SRC0", 16), ("VSRC1", 0)], None),
@@ -6449,7 +6512,7 @@ fn gpu_split_wave64_waves_diverge() {
                 let want: u32 = (0..2 * (w + 1)).map(|i| (5 * i + 3).min(64) as u32 + (w * 64 + 5 * i + 3) as u32).sum();
                 let at = (base + (g * 256 + tid) * 8) / 4;
                 assert_eq!(out[at], want, "{dims:?}, group {g} thread {tid}: loop of wave {w}");
-                assert_eq!(out[at + 1], (w * 64 + (l ^ 33)) as u32, "{dims:?}, group {g} thread {tid}: ds_bpermute");
+                assert_eq!(out[at + 1], (w * 64 + (l ^ 1)) as u32, "{dims:?}, group {g} thread {tid}: ds_bpermute");
             }
         }
     }
@@ -7673,7 +7736,7 @@ fn gpu_ds_swizzle_and_bpermute_zero_inactive_lanes() {
             ("DS_SWIZZLE_B32", "ENC_DS", &[("VDST", 10), ("ADDR", 0), ("OFFSET0", 0x1F), ("OFFSET1", 1 << 2)], None),
             // bpermute targeting odd neighbor -> must be 0
             ("DS_BPERMUTE_B32", "ENC_DS", &[("VDST", 11), ("ADDR", 1), ("DATA0", 0)], None),
-            // bpermute targeting cross-half odd lane (lane ^ 33) -> must be 0
+            // bpermute of index lane ^ 33: lane ^ 1 in wave64 (its half, #772), still odd -> must be 0
             ("DS_BPERMUTE_B32", "ENC_DS", &[("VDST", 12), ("ADDR", 2), ("DATA0", 0)], None),
             // swizzle XOR 2: even lanes read active even lane -> must return its value
             ("DS_SWIZZLE_B32", "ENC_DS", &[("VDST", 13), ("ADDR", 0), ("OFFSET0", 0x1F), ("OFFSET1", 2 << 2)], None),

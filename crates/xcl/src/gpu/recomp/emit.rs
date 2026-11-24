@@ -38,7 +38,7 @@ pub(super) struct Em {
     /// scratch_* used: declare the per-lane private memory
     uses_scratch: bool,
     /// split wave64 (`x64`): words one exchange carries (1: masks and lane reads, up to 16:
-    /// coherent scalar loads, 32: `ds_bpermute`)
+    /// coherent scalar loads)
     x64_words: usize,
     /// split wave64: pc → SGPRs whose whole value may be read after that instruction
     /// (`x64_masks`); a mask written to none of them stays in its half (no exchange)
@@ -4030,23 +4030,17 @@ impl Em {
                 self.write32(&dst, &t);
                 return Ok(());
             }
+            // In wave64 the permute stays in the reader's 32-lane half, as ds_swizzle: lane l reads
+            // (l & 32) | (index & 31) (measured on RDNA2, #772), so the split form needs no
+            // exchange and a 32-lane wave of a wave64 VS / PS never reaches lanes 32..63.
             "ds_bpermute_b32" => {
                 let (a, v) = (self.vreg(f("ADDR")), self.vreg(f("DATA0")));
-                let m = if self.opt.wave64 { 63 } else { 31 };
                 let (el, eh) = (self.sreg(126), self.sreg(127));
                 let eh = if self.opt.wave64 { eh } else { "0u".into() };
-                self.line(&format!("uint {t}_l = (({a} + {off16}u) >> 2) & {m}u;"));
-                let rla = if self.x64() {
-                    self.x64_words = 32;
-                    "xcl_x_rla_any"
-                } else {
-                    "rla"
-                };
+                let half = if self.opt.wave64 { "(lane_id & 32u) | " } else { "" };
+                self.line(&format!("uint {t}_l = {half}((({a} + {off16}u) >> 2) & 31u);"));
+                let rla = self.rla_half_fn();
                 self.line(&format!("uint {t} = {rla}({v}, {t}_l);"));
-                // a 32-lane wave of a wave64 VS / PS: lanes 32..63 hold a constant (`upper_lanes`)
-                if let Some(Read::Const(c)) = self.upper.as_ref().and_then(|u| u.reads.get(&d.pc)).copied() {
-                    self.line(&format!("{t} = select(and(xcl_hw32, {t}_l >= 32u), {c:#010x}u, {t});"));
-                }
                 self.line(&format!("{t} = select(lanebit_at({el}, {eh}, {t}_l), {t}, 0u);"));
                 let dst = Dst::V(f("VDST"));
                 self.write32(&dst, &t);
@@ -5529,20 +5523,13 @@ uint xcl_x_rla_uniform(uint v, uint l) {
     uint o = xcl_x_meet() ? xcl_x_get(0u) : 0u;
     return (l >> 5) == xcl_half ? m : o;
 }
-// ds_bpermute: any lane of the wave
-uint xcl_x_rla_any(uint v, uint l) {
-    xcl_x_put(WaveGetLaneIndex(), v);
-    uint o = xcl_x_meet() ? xcl_x_get(l & 31u) : 0u;
-    uint m = WaveReadLaneAt(v, l & 31u);
-    return (l >> 5) == xcl_half ? m : o;
-}
 // a mask only ever read lane by lane (v_cndmask, carry-ins; `x64_masks`): each half's own
 // word, the other half's 0 – no exchange
 uint2 xcl_x_ballot_local(bool b) {
     uint m = WaveActiveBallot(b).x;
     return xcl_half != 0u ? uint2(0u, m) : uint2(m, 0u);
 }
-// DPP16, DPP8, ds_swizzle, v_permlane(x)16: the ISA keeps the source in the reader's half
+// DPP16, DPP8, ds_swizzle, ds_bpermute, v_permlane(x)16: the source stays in the reader's half
 uint xcl_x_rla_half(uint v, uint l) { return WaveReadLaneAt(v, l & 31u); }
 "#;
 

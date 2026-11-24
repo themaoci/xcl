@@ -7,9 +7,10 @@
 //! lanes 32..63 are not populated, as in the last wave of a draw: inactive, but on the console
 //! their VGPRs exist and can still be written – by `v_writelane`, which ignores EXEC, and by
 //! whole-wave code (EXEC's upper word set, `s_or_saveexec_b64 s, -1`). Here those lanes do
-//! not exist. A read of one – `v_readlane` of a lane ≥ 32 or of a lane from an SGPR,
-//! `ds_bpermute` – needs the value the console lane would hold. This forward analysis follows
-//! it per VGPR lane:
+//! not exist. A read of one – `v_readlane` of a lane ≥ 32 or of a lane from an SGPR, or
+//! `ds_permute` – needs the value the console lane would hold (`ds_bpermute` stays in the
+//! reader's 32-lane half on RDNA2, #772, so lanes < 32 never reach it). This forward analysis
+//! follows it per VGPR lane:
 //! - *unwritten*: nothing wrote the lane, it holds what an earlier wave left in the register.
 //!   A program cannot depend on that, so any value is as right as the console's;
 //! - a *constant*: whole-wave code wrote it – the identity a wave reduction puts into the
@@ -219,8 +220,7 @@ impl State {
 /// How the 32-lane form resolves a lane read (`UpperLanes::reads`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Read {
-    /// the read as it is: the lanes ≥ 32 it can reach are unwritten (or, for `ds_bpermute`,
-    /// inactive, which reads 0 here as on the console)
+    /// the read as it is: the lanes ≥ 32 it can reach are unwritten
     Native,
     /// a lane ≥ 32 holds this constant
     Const(u32),
@@ -248,7 +248,7 @@ impl UpperLanes {
                 out.insert(match (d.inst.name, lane_operand(d)) {
                     ("V_READLANE_B32", Lane::Const(_)) => "v_readlane: lane ≥ 32",
                     ("V_READLANE_B32", _) => "v_readlane: lane number from an SGPR",
-                    _ => "ds_(b)permute: arbitrary lane",
+                    _ => "ds_permute: arbitrary lane",
                 });
             }
         }
@@ -260,7 +260,7 @@ impl UpperLanes {
         self.reads
             .values()
             .filter_map(|r| match r {
-                Read::Native => Some("lanes ≥ 32 never written (or inactive)"),
+                Read::Native => Some("lanes ≥ 32 never written"),
                 Read::Const(_) => Some("lane ≥ 32 holds a constant (whole-wave identity)"),
                 Read::Shadow => Some("spill slot from its v_writelane shadow"),
                 Read::Unknown => None,
@@ -273,7 +273,7 @@ impl UpperLanes {
 fn reaches_upper(d: &Decoded) -> bool {
     match d.inst.name {
         "V_READLANE_B32" => !matches!(lane_operand(d), Lane::Const(l) if l < 32),
-        "DS_BPERMUTE_B32" | "DS_PERMUTE_B32" => true,
+        "DS_PERMUTE_B32" => true,
         _ => false,
     }
 }
@@ -703,10 +703,6 @@ fn classify(d: &Decoded, st: &State) -> Option<(Read, Option<(u64, u32)>)> {
                 Lane::Sgpr => Some((any_upper(v), None)),
             }
         }
-        "DS_BPERMUTE_B32" => {
-            // source lanes ≥ 32 inactive: 0, as `Em::ds` gives for them
-            Some((if st.s[127] == Word::Zero { Read::Native } else { any_upper(fv("DATA0")) }, None))
-        }
         "DS_PERMUTE_B32" => Some((Read::Unknown, None)),
         _ => None,
     }
@@ -892,9 +888,8 @@ mod tests {
             ("S_AND_B64", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 72), ("SSRC1", 126)], None),
             ("S_FF1_I32_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 0)], None),
             ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 4), ("SRC0", V + 51), ("SRC1", 0)], None),
-            ("DS_BPERMUTE_B32", "ENC_DS", &[("VDST", 1), ("ADDR", 2), ("DATA0", 51)], None),
         ]);
-        assert_eq!(r, vec![Read::Native, Read::Native]);
+        assert_eq!(r, vec![Read::Native]);
         // after s_mov_b64 exec, -1 (no saved copy) the same move writes the upper lanes
         let r = reads(&[
             ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 193)], None),
@@ -902,7 +897,8 @@ mod tests {
             ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 4), ("SRC0", V + 51), ("SRC1", 0)], None),
             ("DS_BPERMUTE_B32", "ENC_DS", &[("VDST", 1), ("ADDR", 2), ("DATA0", 51)], None),
         ]);
-        assert_eq!(r, vec![Read::Unknown, Read::Unknown]);
+        // ds_bpermute stays in the reader's half (#772): lanes < 32 never read lanes ≥ 32
+        assert_eq!(r, vec![Read::Unknown]);
     }
 
     #[test]
