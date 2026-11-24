@@ -6268,6 +6268,124 @@ fn gpu_ds_bpermute_wave64_stays_in_its_half() {
     assert_eq!([r.vgpr[31][12], r.vgpr[63][12]], [1000, 1032], "(lane + 1) & 63: lanes 31, 63");
 }
 
+/// Split wave64: the half, the console wave and the other half's size come from the hardware
+/// wave's first console thread (`xcl_wb`, through `WaveReadLaneFirst`), so the GPU compiler
+/// knows them – and the exchanged EXEC / VCC / SGPRs and their branches – to be wave-uniform.
+/// The values are those of the per-lane formulas they replace: checked against them for every
+/// group size up to 1024 and several orders in which the hardware waves take their console
+/// threads (`xcl_x_thread`), and the HLSL of each mode pinned (the native forms keep theirs).
+#[test]
+fn split_wave64_wave_uniform_half() {
+    // xcl_x_thread: each full hardware wave takes the next 32 console threads from a counter
+    // as it arrives, a partial one (threads % 32) the last ones; lane = the prefix count
+    for threads in 1u32..=1024 {
+        let full = threads / 32;
+        for rot in [0u32, 1, full / 2, full.saturating_sub(1)] {
+            let mut bases: Vec<u32> = (0..full).map(|k| 32 * ((k + rot) % full.max(1))).collect();
+            let rest = threads % 32;
+            if rest != 0 {
+                bases.push(threads & !31);
+            }
+            for &base in &bases {
+                let n = if base == threads & !31 && rest != 0 { rest } else { 32 };
+                let wb = base & !31; // WaveReadLaneFirst(xcl_tid) & ~31u: the first lane's prefix is 0
+                for p in 0..n {
+                    let tid = base + p;
+                    let xn_old = if threads > ((tid & !31) ^ 32) { 32u32.min(threads - ((tid & !31) ^ 32)) } else { 0 };
+                    let xn_new = if threads > (wb ^ 32) { 32u32.min(threads - (wb ^ 32)) } else { 0 };
+                    assert_eq!(((tid >> 5) & 1, tid >> 6, xn_old), ((wb >> 5) & 1, wb >> 6, xn_new), "{threads} threads, console thread {tid}");
+                    // the wave index of TG_SIZE and of mesh s3 (gi / 64 with gi = xcl_tid)
+                    assert_eq!(tid / 64, wb >> 6, "{threads} threads, console thread {tid}");
+                }
+            }
+        }
+    }
+    let code = prog(&[
+        ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 255), ("VSRC1", 0)], Some(40)),
+        ("S_CBRANCH_VCCZ", "ENC_SOPP", &[("SIMM16", 1)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 129)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 2)], None), // TG_SIZE in compute
+    ]);
+    let entry = "    uint xcl_tid = xcl_x_thread(gi);\n    lane_id = xcl_tid & 63u;\n    uint xcl_wb = WaveReadLaneFirst(xcl_tid) & ~31u;\n    xcl_half = (xcl_wb >> 5) & 1u;\n    xcl_cw = xcl_wb >> 6;\n    xcl_xn = XCL_X_THREADS > (xcl_wb ^ 32u) ? min(32u, XCL_X_THREADS - (xcl_wb ^ 32u)) : 0u;\n";
+    let cs = |threads: u32| Mode::Compute(super::CsInterface { threads: [threads, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: true, tid_components: 1 });
+    let ms = Mode::Mesh(super::MsInterface { threads: 128, max_vertices: 64, max_primitives: 64, outputs: vec![] });
+    for mode in [Mode::Kernel, cs(96), cs(256), ms] {
+        let split = translate(&code, &Options { mode: mode.clone(), wave64: true, split_wave64: true, ..Default::default() }).unwrap();
+        assert!(split.complete(), "{:?}", split.unsupported_why);
+        assert!(split.hlsl.contains(entry), "{mode:?}\n{}", split.hlsl);
+        assert!(!split.hlsl.contains("(xcl_tid >> 5)") && !split.hlsl.contains("xcl_tid >> 6"), "{mode:?}");
+        let native = translate(&code, &Options { mode: mode.clone(), wave64: true, split_wave64: false, ..Default::default() }).unwrap();
+        assert!(!native.hlsl.contains("xcl_wb") && !native.hlsl.contains("xcl_cw"), "{mode:?}");
+        match &mode {
+            Mode::Compute(c) => {
+                // TG_SIZE (s2): the wave index is the console wave
+                let w = c.threads[0].div_ceil(64);
+                assert!(split.hlsl.contains(&format!("    s2 = {w}u | (xcl_cw << 6);\n")), "{}", split.hlsl);
+                assert!(native.hlsl.contains(&format!("    s2 = {w}u | ((gi / 64u) << 6);\n")), "{}", native.hlsl);
+            }
+            Mode::Mesh(_) => {
+                assert!(split.hlsl.contains("    uint xcl_wave = xcl_cw;\n"));
+                assert!(native.hlsl.contains("    uint xcl_wave = gi / 64u;\n"));
+            }
+            _ => {}
+        }
+        if super::dxc::location().is_ok() {
+            super::dxc::compile(&split.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", split.hlsl));
+        }
+    }
+}
+
+/// Groups that are not a multiple of 64 threads (a console wave without its upper half, or
+/// with part of it) and several console waves per group: EXEC at entry (the other half's
+/// size), a mask read whole (s_bcnt1 of vcc: exchanged), a mask read lane by lane (half-local)
+/// and TG_SIZE's wave index give the console's values in every console wave – the half, the
+/// console wave and the other half's size of the split form (32-lane GPUs) included.
+#[test]
+fn gpu_split_wave64_partial_groups() {
+    if !gpu_ready() {
+        return;
+    }
+    use super::{dxc, CsInterface};
+    // out[thread] = (popcount(vcc = lane < 40), popcount(exec), TG_SIZE, lane < 20 ? 7 : 5)
+    let p = prog(&[
+        ("V_AND_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 255), ("VSRC1", 0)], Some(63)), // lane
+        ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 255), ("VSRC1", 2)], Some(40)),
+        ("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 106)], None),
+        ("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 11), ("SSRC0", 126)], None),
+        ("V_CMP_LT_U32", "ENC_VOP3", &[("VDST", 20), ("SRC0", V + 2), ("SRC1", 255)], Some(20)),
+        ("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 7), ("SRC0", 133), ("SRC1", 135), ("SRC2", 20)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 10)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 11)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", 2)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 8), ("SRC0", 132), ("VSRC1", 0)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 9), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORDX4", "ENC_FLAT_GLBL", &[("ADDR", 8), ("DATA", 4), ("SADDR", 0x7D)], None),
+    ]);
+    for threads in [40u32, 64, 96, 100, 160, 256] {
+        let cs = CsInterface { threads: [threads, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: true, tid_components: 1 };
+        let t = translate(&p, &on_gpu(Options { mode: Mode::Compute(cs), wave64: true, ..Default::default() })).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        if runner::split_wave64() {
+            assert_eq!(t.hlsl.matches("= xcl_x_ballot(and(").count(), 1, "{threads}: the vcc read whole");
+            assert_eq!(t.hlsl.matches("= xcl_x_ballot_local(and(").count(), 1, "{threads}: the selector");
+        }
+        let dxil = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
+        // three groups, all writing the same values to the same addresses (v0 = thread in the group)
+        let out = runner::dispatch(&dxil, [3, 1, 1], &[0u32; 128], &vec![0xFFFF_FFFFu32; (threads * 4) as usize]).unwrap();
+        let waves = threads.div_ceil(64);
+        for k in 0..threads {
+            let (w, l) = (k / 64, k % 64);
+            let n = 64.min(threads - 64 * w);
+            let at = (4 * k) as usize;
+            let what = format!("{threads} threads, thread {k} (console wave {w}, lane {l})");
+            assert_eq!(out[at], n.min(40), "{what}: s_bcnt1 of vcc");
+            assert_eq!(out[at + 1], n, "{what}: s_bcnt1 of exec at entry");
+            assert_eq!(out[at + 2], waves | w << 6, "{what}: TG_SIZE");
+            assert_eq!(out[at + 3], if l < 20 { 7 } else { 5 }, "{what}: v_cndmask on a half-local mask");
+        }
+    }
+}
+
 /// Operations whose result spans both 32-lane halves of a wave64 – what the split form
 /// exchanges: masks with bits in either half (counted, scanned, branched on), readlane /
 /// readfirstlane of a lane in the other half, a GLC scalar load – and ds_bpermute, which

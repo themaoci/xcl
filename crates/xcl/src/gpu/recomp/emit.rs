@@ -4420,9 +4420,15 @@ impl Em {
 
     /// Split wave64, at the start of `main`: the console thread this thread stands for
     /// (`xcl_tid`, `xcl_x_thread`), its lane, half and wave, and the size of the other half.
+    /// The half, the console wave and the other half's size are the same in every lane of the
+    /// hardware wave (its console threads are 32-aligned): they come from `xcl_wb`, its first
+    /// console thread, through `WaveReadLaneFirst`, so the GPU compiler knows them to be
+    /// wave-uniform – and with them what the exchanges return (EXEC, VCC, the SGPRs, their
+    /// branches), which it otherwise has to treat as per-lane values and divergent branches.
     fn x64_entry(&self, h: &mut String) {
-        h.push_str("    uint xcl_tid = xcl_x_thread(gi);\n    lane_id = xcl_tid & 63u;\n    xcl_half = (xcl_tid >> 5) & 1u;\n    xcl_cw = xcl_tid >> 6;\n");
-        h.push_str("    xcl_xn = XCL_X_THREADS > ((xcl_tid & ~31u) ^ 32u) ? min(32u, XCL_X_THREADS - ((xcl_tid & ~31u) ^ 32u)) : 0u;\n");
+        h.push_str("    uint xcl_tid = xcl_x_thread(gi);\n    lane_id = xcl_tid & 63u;\n    uint xcl_wb = WaveReadLaneFirst(xcl_tid) & ~31u;\n");
+        h.push_str("    xcl_half = (xcl_wb >> 5) & 1u;\n    xcl_cw = xcl_wb >> 6;\n");
+        h.push_str("    xcl_xn = XCL_X_THREADS > (xcl_wb ^ 32u) ? min(32u, XCL_X_THREADS - (xcl_wb ^ 32u)) : 0u;\n");
     }
 
     pub fn finish(&self, body: &str) -> String {
@@ -4626,8 +4632,10 @@ impl Em {
                     }
                 }
                 if cs.tg_size && sg.contains(&next) {
-                    // waves in the group: a last, partial wave counts (96 threads: 2 of 64)
-                    let _ = writeln!(h, "    {} = {}u | ((gi / {lanes}u) << 6);", sname(next).unwrap(), (x * y * z).div_ceil(lanes));
+                    // waves in the group: a last, partial wave counts (96 threads: 2 of 64);
+                    // split, the wave index is `xcl_cw` (gi / 64, known to be wave-uniform)
+                    let wave = if self.x64() { "xcl_cw".to_string() } else { format!("(gi / {lanes}u)") };
+                    let _ = writeln!(h, "    {} = {}u | ({wave} << 6);", sname(next).unwrap(), (x * y * z).div_ceil(lanes));
                 }
                 let _ = writeln!(h, "    uint scc = 0u;\n    {{ uint2 e0 = {}(true); exec_lo = e0.x; exec_hi = e0.y; }}", self.ballot_fn());
                 for &v in &self.vgprs {
@@ -4666,7 +4674,9 @@ impl Em {
                     h.push_str("    lane_id = WaveGetLaneIndex();\n");
                 }
                 // thread index in the group as the console numbers it: wave · lanes + lane
-                let _ = writeln!(h, "    uint xcl_wave = gi / {lanes}u;\n    uint xcl_slot = xcl_wave * {lanes}u + lane_id;");
+                // (split: the console wave `xcl_cw`, the same value known to be wave-uniform)
+                let wave = if self.x64() { "xcl_cw".to_string() } else { format!("gi / {lanes}u") };
+                let _ = writeln!(h, "    uint xcl_wave = {wave};\n    uint xcl_slot = xcl_wave * {lanes}u + lane_id;");
                 let _ = writeln!(h, "    uint xcl_rec = gid.x * {}u;", ms.record_dwords());
                 let _ = writeln!(h, "    uint xcl_vtx = xcl_rec + {MESH_HEADER}u + xcl_slot * {}u;", ms.vert_dwords());
                 let _ = writeln!(h, "    uint xcl_prm = xcl_rec + {}u + xcl_slot;", MESH_HEADER + ms.max_vertices as usize * ms.vert_dwords());
@@ -4769,7 +4779,8 @@ impl Em {
                     let _ = writeln!(h, "        bool xcl_es_phase = {};", if es { "true" } else { "false" });
                     let _ = writeln!(h, "        uint xcl_entry_pc = {}u;", if es { 0 } else { gs_start });
                     // the GS phase has no other half to exchange with
-                    let _ = writeln!(h, "        lane_id = gi; xcl_half = gi >> 5; xcl_xn = {}u;", if es { 32 } else { 0 });
+                    // the half from the wave's first lane: the same value, known to be wave-uniform
+                    let _ = writeln!(h, "        lane_id = gi; xcl_half = WaveReadLaneFirst(gi) >> 5; xcl_xn = {}u;", if es { 32 } else { 0 });
                     let _ = writeln!(h, "        uint xcl_emitted = 0u, xcl_strip = 0u, xcl_ntri = 0u, xcl_gs_base = 0xFFFFFFFFu;\n        uint xcl_tri[{maxt}];");
                     load_sgprs(h);
                     if sg.contains(&2) {
