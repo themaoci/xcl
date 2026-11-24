@@ -1966,6 +1966,65 @@ fn gpu_typed_buffer_loads_and_stores() {
     assert_eq!(r.sgpr[50], 1 | 1 << 5, "s_bitset1");
 }
 
+/// RDNA2 ISA "Buffer Data": tbuffer_* take the format from the instruction and the identity
+/// DST_SEL; only buffer_*_format apply the V#'s DST_SEL.
+#[test]
+fn tbuffer_load_ignores_vsharp_dst_sel() {
+    let code = prog(&[
+        ("BUFFER_LOAD_FORMAT_XYZW", "ENC_MUBUF", &[("VDATA", 10), ("SRSRC", 3), ("SOFFSET", 128)], None),
+        ("TBUFFER_LOAD_FORMAT_XYZW", "ENC_MTBUF", &[("VDATA", 14), ("SRSRC", 3), ("SOFFSET", 128), ("FORMAT", 60)], None),
+        ("TBUFFER_LOAD_FORMAT_D16_XYZ", "ENC_MTBUF", &[("VDATA", 18), ("SRSRC", 3), ("SOFFSET", 128), ("FORMAT", 29)], None),
+    ]);
+    let t = translate(&code, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
+    assert!(t.hlsl.contains("v10 = select(t1_ok, dst_sel(t1_c, (s15 >> 0u) & 7u, t1_int), 0u);"), "{}", t.hlsl);
+    for (k, c) in ["x", "y", "z", "w"].iter().enumerate() {
+        assert!(t.hlsl.contains(&format!("v{} = select(t2_ok, t2_c.{c}, 0u);", 14 + k)), "{}", t.hlsl);
+    }
+    assert!(!t.hlsl.contains("dst_sel(t2_c") && !t.hlsl.contains("dst_sel(t3_c"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("v18 = t3_ok ? (select(t3_int, t3_c.x & 0xFFFFu, f32tof16(asfloat(t3_c.x))) | (select(t3_int, t3_c.y"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("v19 = t3_ok ? (select(t3_int, t3_c.z & 0xFFFFu, f32tof16(asfloat(t3_c.z))) | (0u << 16)) : 0u;"), "{}", t.hlsl);
+    if super::dxc::location().is_ok() {
+        super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+    }
+}
+
+#[test]
+fn gpu_tbuffer_load_identity_dst_sel() {
+    if !gpu_ready() {
+        return;
+    }
+    let bgra = 6 | 5 << 3 | 4 << 6 | 7 << 9;
+    let code = prog(&[
+        ("BUFFER_LOAD_FORMAT_XYZW", "ENC_MUBUF", &[("VDATA", 10), ("SRSRC", 3), ("SOFFSET", 128)], None),
+        ("TBUFFER_LOAD_FORMAT_XYZW", "ENC_MTBUF", &[("VDATA", 14), ("SRSRC", 3), ("SOFFSET", 128), ("FORMAT", 60)], None),
+        ("TBUFFER_LOAD_FORMAT_XYZW", "ENC_MTBUF", &[("VDATA", 18), ("SRSRC", 4), ("SOFFSET", 128), ("FORMAT", 29)], None),
+        ("TBUFFER_LOAD_FORMAT_D16_XYZW", "ENC_MTBUF", &[("VDATA", 22), ("SRSRC", 4), ("SOFFSET", 128), ("FORMAT", 29)], None),
+        ("TBUFFER_LOAD_FORMAT_D16_XY", "ENC_MTBUF", &[("VDATA", 24), ("SRSRC", 3), ("SOFFSET", 128), ("FORMAT", 60)], None),
+        ("BUFFER_LOAD_FORMAT_X", "ENC_MUBUF", &[("VDATA", 25), ("SRSRC", 4), ("SOFFSET", 128)], None),
+    ]);
+    let mut mem = vec![0u32; 128];
+    mem[0x100 / 4] = u32::from_le_bytes([1, 2, 3, 4]); // 8_8_8_8_UINT
+    mem[0x110 / 4] = 0x3C00 | 0xC000 << 16; // 16_16_FLOAT (1.0, -2.0)
+    let mut st = KernelState::default();
+    // V# A: 8_8_8_8_UINT, DST_SEL = (z, y, x, w); V# B: 16_UINT, every DST_SEL = SEL_0
+    st.sgpr[12..16].copy_from_slice(&[0x100, 0, 0x100, bgra | 60 << 12]);
+    st.sgpr[16..20].copy_from_slice(&[0x110, 0, 0x100, 11 << 12]);
+    for r in st.vgpr.iter_mut() {
+        r[25] = 0xDEAD_BEEF;
+    }
+    let r = runner::run_code(&code, &st, &mem).unwrap();
+    for l in 0..64 {
+        let v = &r.vgpr[l];
+        assert_eq!(v[10..14], [3, 2, 1, 4], "lane {l} buffer_load_format applies the V# DST_SEL");
+        assert_eq!(v[14..18], [1, 2, 3, 4], "lane {l} tbuffer xyzw: identity DST_SEL");
+        assert_eq!(v[18..22], [f(1.0), f(-2.0), 0, f(1.0)], "lane {l} tbuffer 16_16_FLOAT: V# SEL_0 ignored, z = 0, w = 1");
+        assert_eq!(v[22..24], [0xC000_3C00, 0x3C00_0000], "lane {l} tbuffer d16 xyzw");
+        assert_eq!(v[24], 1 | 2 << 16, "lane {l} tbuffer d16 xy: identity DST_SEL");
+        assert_eq!(v[25], 0, "lane {l} buffer_load_format 16_UINT (0x3C00) with SEL_0 everywhere");
+    }
+}
+
 fn el(name: &str, index: u32, sv: u32, ct: u32, reg: u32, mask: u8) -> crate::gpu::dxbc::SigElement {
     crate::gpu::dxbc::SigElement { name: name.into(), index, system_value: sv, component_type: ct, register: reg, mask, rw_mask: mask, stream: 0 }
 }

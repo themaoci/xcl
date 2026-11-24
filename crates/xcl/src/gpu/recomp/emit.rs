@@ -1848,8 +1848,17 @@ impl Em {
                 self.line(&format!("if ({act}) {{ {} }}", st.join(" ")));
             }
             BufKind::FormatLoad => {
-                // format from the instruction (tbuffer) or from the V# (dword3 [18:12]); DST_SEL from the V#
-                let fmt = if d.enc.name == "ENC_MTBUF" { format!("{}u", f("FORMAT")) } else { format!("(({d3} >> 12) & 0x7Fu)") };
+                // buffer_load_format: format (dword3 [18:12]) and DST_SEL from the V#; tbuffer: format
+                // from the instruction and the identity DST_SEL (the V#'s is ignored; ISA "Buffer Data")
+                let mtbuf = d.enc.name == "ENC_MTBUF";
+                let fmt = if mtbuf { format!("{}u", f("FORMAT")) } else { format!("(({d3} >> 12) & 0x7Fu)") };
+                let pick = |k: u64| {
+                    if mtbuf {
+                        format!("{t}_c.{}", ["x", "y", "z", "w"][k as usize])
+                    } else {
+                        format!("dst_sel({t}_c, ({d3} >> {}u) & 7u, {t}_int)", 3 * k)
+                    }
+                };
                 self.line(&format!("uint {t}_info = FMT_INFO[min({fmt}, 77u)];"));
                 self.line(&format!("bool {t}_int = ((({t}_info >> 3) & 7u) == 4u) || ((({t}_info >> 3) & 7u) == 5u);"));
                 self.line(&format!("bool {t}_ok = and(({t}_info & 7u) != 0u, {});", in_range(format!("fmt_bytes({t}_info)"))));
@@ -1859,7 +1868,7 @@ impl Em {
                 ));
                 if let Some((_, components, high)) = d16_format {
                     let half = |component: u64| {
-                        let selected = format!("dst_sel({t}_c, ({d3} >> {}u) & 7u, {t}_int)", 3 * component);
+                        let selected = pick(component);
                         format!("select({t}_int, {selected} & 0xFFFFu, f32tof16(asfloat({selected})))")
                     };
                     let mut assigns = Vec::new();
@@ -1880,7 +1889,7 @@ impl Em {
                 let mut assigns = Vec::new();
                 for i in 0..count {
                     let v = self.vreg(vdata + i);
-                    assigns.push(format!("{v} = select({t}_ok, dst_sel({t}_c, ({d3} >> {}u) & 7u, {t}_int), 0u);", 3 * i));
+                    assigns.push(format!("{v} = select({t}_ok, {}, 0u);", pick(i)));
                 }
                 self.line(&format!("if ({act}) {{ {} }}", assigns.join(" ")));
             }
