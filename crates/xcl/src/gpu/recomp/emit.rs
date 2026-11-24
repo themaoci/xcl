@@ -446,13 +446,10 @@ fn is_f64_rounded_op(name: &str) -> bool {
         && !matches!(name, "v_cvt_f32_f64" | "v_cvt_i32_f64" | "v_cvt_u32_f64" | "v_frexp_exp_i32_f64")
 }
 
-/// HLSL expression converting float expression `e` to a 16-bit half (`0..=0xFFFF`).
+/// HLSL expression converting float expression `e` to a 16-bit half (`0..=0xFFFF`), rounded in
+/// the shader's mode: nearest even by default (legacy `f32tof16` rounds toward zero, #111).
 fn to_f16_expr(dynamic_rm: bool, e: &str) -> String {
-    if dynamic_rm {
-        to_f16_rounded_expr(true, e)
-    } else {
-        format!("(f32tof16({e}) & 0xFFFFu)")
-    }
+    to_f16_rounded_expr(dynamic_rm, e)
 }
 
 /// Round an exact binary32 input in the selected RDNA mode. Legacy `f32tof16`
@@ -3036,6 +3033,12 @@ impl Em {
             "v_exp_f16" => fr(format!("exp2({})", fh(0))),
             "v_sin_f16" => fr(format!("sin({} * 6.2831853f)", fh(0))),
             "v_cos_f16" => fr(format!("cos({} * 6.2831853f)", fh(0))),
+            // fract_f clamps below 1.0 in binary32, but 1 - 2^-24 narrows to 1.0 in binary16 by
+            // nearest even: keep the binary16 result below 1.0 too (0x3BFF) (#655)
+            "v_fract_f16" if m.omod == 0 => {
+                let h = fr(format!("fract_f({})", fh(0)));
+                format!("select({h} == 0x3C00u, 0x3BFFu, {h})")
+            }
             "v_fract_f16" => fr(format!("fract_f({})", fh(0))),
             "v_floor_f16" => fr(format!("floor({})", fh(0))),
             "v_ceil_f16" => fr(format!("ceil({})", fh(0))),

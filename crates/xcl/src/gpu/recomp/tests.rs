@@ -6900,6 +6900,172 @@ fn gpu_nonfused_mad_and_mac_prevent_fma_contraction() {
     assert_eq!(v1[16], 0x2880_0000, "v_fma_f32 cancellation control should stay fused");
 }
 
+/// An exact value rounded to binary16 bits, to nearest even (`rne`) or toward zero. NaN gives the
+/// quiet NaN 0x7E00. f64 holds every input and result of the tests below exactly or, for sqrt,
+/// rcp, rsq, exp2 and log2, correctly rounded to 53 bits.
+fn f16_round(x: f64, rne: bool) -> u16 {
+    if x.is_nan() {
+        return 0x7E00;
+    }
+    let s: u16 = if x.is_sign_negative() { 0x8000 } else { 0 };
+    let a = x.abs();
+    if a.is_infinite() {
+        return s | 0x7C00;
+    }
+    // the binary16 step at a: 2^-24 below 2^-14 (subnormals), else 2^(e - 10)
+    let e = if a < 2f64.powi(-14) { -14 } else { a.log2().floor() as i32 };
+    let e = if a >= 2f64.powi(e + 1) { e + 1 } else if a < 2f64.powi(e) { e - 1 } else { e };
+    let unit = 2f64.powi(e.max(-14) - 10);
+    let q = a / unit;
+    let mut m = q.floor();
+    let frac = q - m;
+    if rne && (frac > 0.5 || (frac == 0.5 && m % 2.0 == 1.0)) {
+        m += 1.0;
+    }
+    let bits = if e < -14 || a < 2f64.powi(-14) { m as u32 } else { ((e + 15) as u32) * 1024 + (m as u32 - 1024) };
+    let bits = if bits >= 0x7C00 { if rne { 0x7C00 } else { 0x7BFF } } else { bits };
+    s | bits as u16
+}
+
+/// The f16 results that go through the f32 → f16 narrowing (`to_f16_expr`) in the default mode,
+/// round to nearest even, against an exact reference. Printed per instruction (--nocapture): how
+/// many inexact results are the nearest-even binary16 value, how many the toward-zero one, how many
+/// neither. Fails when an exact operation (add, ldexp, mul) gives anything but the nearest even.
+#[test]
+fn gpu_f16_results_round_to_nearest_even_by_default() {
+    for wave64 in gpu_waves() {
+        f16_rounding_census(wave64);
+    }
+}
+
+fn f16_rounding_census(wave64: bool) {
+    let iters: usize = std::env::var("XCL_FUZZ_ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(50);
+    let p = prog(&[
+        ("V_ADD_F16", "ENC_VOP2", &[("VDST", 10), ("SRC0", V), ("VSRC1", 1)], None),
+        ("V_SQRT_F16", "ENC_VOP1", &[("VDST", 11), ("SRC0", V)], None),
+        ("V_RCP_F16", "ENC_VOP1", &[("VDST", 12), ("SRC0", V)], None),
+        ("V_RSQ_F16", "ENC_VOP1", &[("VDST", 13), ("SRC0", V)], None),
+        ("V_EXP_F16", "ENC_VOP1", &[("VDST", 14), ("SRC0", V + 3)], None),
+        ("V_LOG_F16", "ENC_VOP1", &[("VDST", 15), ("SRC0", V)], None),
+        ("V_LDEXP_F16", "ENC_VOP2", &[("VDST", 16), ("SRC0", V), ("VSRC1", 2)], None),
+        ("V_MUL_F16", "ENC_VOP2", &[("VDST", 17), ("SRC0", V), ("VSRC1", 1)], None), // control: already nearest even
+    ]);
+    let (dxil, mem) = kernel_wave(&p, wave64);
+    let lanes = if wave64 { 64 } else { 32 };
+    let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+    let names = ["add", "sqrt", "rcp", "rsq", "exp", "log", "ldexp", "mul"];
+    let mut counts = [[0usize; 3]; 8]; // nearest even, toward zero, neither
+    let mut odd: Vec<String> = Vec::new();
+    for _ in 0..iters {
+        let mut st = KernelState::default();
+        let mut xs = Vec::new();
+        for r in st.vgpr.iter_mut() {
+            // finite positive or negative normals and subnormals; exp gets a value in [-26, 17)
+            let h = |rng: &mut Rng| (rng.next() as u16 & 0xFBFF) | if rng.below(4) == 0 { 0 } else { 0x0400 };
+            let (a, b) = (h(&mut rng), h(&mut rng));
+            let n = rng.below(81) as i16 - 40;
+            let x = f16_round(rng.below(43 * 64) as f64 / 64.0 - 26.0, true);
+            (r[0], r[1], r[2], r[3]) = (a as u32, b as u32, n as u16 as u32, x as u32);
+            xs.push((a, b, n, x));
+        }
+        let r = runner::run(&dxil, &st, &mem).unwrap();
+        for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
+            let (a, b, n, x) = xs[l];
+            let (fa, fb, fx) = (f16_to_f64(a), f16_to_f64(b), f16_to_f64(x));
+            let refs = [fa + fb, fa.sqrt(), 1.0 / fa, 1.0 / fa.sqrt(), fx.exp2(), fa.log2(), fa * 2f64.powi(n as i32), fa * fb];
+            for (k, want) in refs.into_iter().enumerate() {
+                if !want.is_finite() || want == 0.0 {
+                    continue;
+                }
+                let (rne, rtz) = (f16_round(want, true), f16_round(want, false));
+                if rne == rtz {
+                    continue; // exact in binary16: no rounding to tell apart
+                }
+                let got = (v[10 + k] & 0xFFFF) as u16;
+                let c = if got == rne { 0 } else if got == rtz { 1 } else { 2 };
+                counts[k][c] += 1;
+                // add, ldexp and mul are exact operations, rounded once: always the nearest even
+                // value. sqrt, rcp, rsq, exp and log are 1-ulp approximations on RDNA: counted only.
+                if c != 0 && matches!(k, 0 | 6 | 7) {
+                    odd.push(format!("{}({a:#06x}, {}) = {got:#06x}, nearest even {rne:#06x}, toward zero {rtz:#06x}", names[k], if k == 6 { format!("{n}") } else { format!("{b:#06x}") }));
+                }
+            }
+        }
+    }
+    println!("wave{lanes}, inexact results [nearest even, toward zero, neither]:");
+    for (k, c) in counts.iter().enumerate() {
+        println!("  v_{}_f16: {c:?}", names[k]);
+    }
+    odd.sort();
+    odd.dedup();
+    for o in odd.iter().take(20) { println!("  {o}"); }
+    assert!(odd.is_empty());
+}
+
+/// The unary f16 results in the default mode: ldexp (exact in binary32), sqrt, rcp, rsq, exp and
+/// log are narrowed to binary16 by nearest even, not toward zero. The inputs put each exact
+/// result 0.69–0.88 of a binary16 step above the lower neighbour, far from a tie, so a 1-ulp
+/// binary32 approximation still narrows to the same value; toward zero gives the lower one.
+/// ldexp also overflows to +inf and rounds a binary16 denormal to even.
+#[test]
+fn gpu_f16_unary_results_round_to_nearest_even() {
+    for wave64 in gpu_waves() {
+        let p = prog(&[
+            ("V_SQRT_F16", "ENC_VOP1", &[("VDST", 10), ("SRC0", V)], None),
+            ("V_RCP_F16", "ENC_VOP1", &[("VDST", 11), ("SRC0", V + 1)], None),
+            ("V_RSQ_F16", "ENC_VOP1", &[("VDST", 12), ("SRC0", V + 2)], None),
+            ("V_EXP_F16", "ENC_VOP1", &[("VDST", 13), ("SRC0", V + 3)], None),
+            ("V_LOG_F16", "ENC_VOP1", &[("VDST", 14), ("SRC0", V + 4)], None),
+            ("V_LDEXP_F16", "ENC_VOP2", &[("VDST", 15), ("SRC0", V + 5), ("VSRC1", 6)], None),
+            ("V_LDEXP_F16", "ENC_VOP2", &[("VDST", 16), ("SRC0", V + 7), ("VSRC1", 8)], None),
+        ]);
+        // input → nearest-even result (toward zero gives one less)
+        let ins: [u32; 9] = [0x3420, 0x3414, 0x341F, 0x3405, 0x3C06, 0x7BFF, 1, 0x3C03, (-15i32) as u32];
+        let want: [(&str, usize, u16); 7] = [
+            ("sqrt(0x3420) = 0.50775", 10, 0x3810),
+            ("rcp(0x3414) = 3.92337", 11, 0x43D9),
+            ("rsq(0x341f) = 1.97040", 12, 0x3FE2),
+            ("exp2(0x3405) = 1.19021", 13, 0x3CC3),
+            ("log2(0x3c06) = 0.00843", 14, 0x2051),
+            ("ldexp(0x7bff, 1) = 131008 overflows", 15, 0x7C00),
+            ("ldexp(0x3c03, -15) = 513.5 denormal steps, to even", 16, 0x0202),
+        ];
+        let mut st = KernelState::default();
+        for r in st.vgpr.iter_mut() {
+            r[..9].copy_from_slice(&ins);
+        }
+        let (r, lanes) = run_wave(&p, &st, wave64);
+        for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
+            for (what, reg, expect) in want {
+                assert_eq!(v[reg] & 0xFFFF, expect as u32, "wave{lanes} lane {l}: {what}");
+            }
+        }
+    }
+}
+
+/// v_fract_f16 in the default mode: the result stays below 1.0 after the nearest-even
+/// narrowing (x = -2^-14 is 1 - 2^-14 exactly in binary32, which rounds to 1.0 in binary16),
+/// NaN stays NaN, and an exact fraction is unchanged (#655).
+#[test]
+fn gpu_fract_f16_stays_below_one_with_nearest_even() {
+    for wave64 in gpu_waves() {
+        let p = prog(&[("V_FRACT_F16", "ENC_VOP1", &[("VDST", 10), ("SRC0", V)], None)]);
+        // input → result
+        let cases: [(u16, u16); 4] = [(0x8400, 0x3BFF), (0x8001, 0x3BFF), (0x3D00, 0x3400), (0x7E00, 0x7E00)];
+        let mut st = KernelState::default();
+        for (l, r) in st.vgpr.iter_mut().enumerate() {
+            r[0] = cases[l % cases.len()].0 as u32;
+        }
+        let (r, lanes) = run_wave(&p, &st, wave64);
+        for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
+            let (x, want) = cases[l % cases.len()];
+            let got = (v[10] & 0xFFFF) as u16;
+            let nan = |h: u16| h & 0x7C00 == 0x7C00 && h & 0x3FF != 0;
+            assert!(got == want || (nan(want) && nan(got)), "wave{lanes} lane {l}: fract({x:#06x}) = {got:#06x}, want {want:#06x}");
+        }
+    }
+}
+
 #[test]
 fn gpu_f16_defaults_to_round_to_nearest_even() {
     if !gpu_ready() {
