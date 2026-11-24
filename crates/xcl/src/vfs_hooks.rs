@@ -45,6 +45,12 @@ impl Drop for Guard {
     }
 }
 
+/// Keep XCL's own file accesses on the host even when a console mount shadows the path.
+pub(crate) fn with_host_io<T>(f: impl FnOnce() -> T) -> T {
+    let _guard = Guard::enter();
+    f()
+}
+
 macro_rules! orig {
     ($slot:ident as $ty:ty) => {
         std::mem::transmute::<usize, $ty>($slot.load(Ordering::Acquire))

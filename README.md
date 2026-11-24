@@ -100,7 +100,8 @@ it is set it is the *only* folder searched: a wrong path fails instead of fallin
   folder has DXC 1.7.2308 or 1.8.2502, depending on the SDK's revision). DXC 1.7's DXIL was 2–2.7 times the
   size of 1.9's for translated compute programs and took an NVIDIA driver 1.4–2.2 times as long to build
   pipelines from ([#156](https://github.com/ivall/xcl/issues/156)). `xcl run` prints the DXC it loaded, and
-  `report.json` has it under `dxc`.
+  `report.json` has it under `dxc`. `XCL_DXC_DIR` is a Windows host path, including when the SDK
+  is on a drive such as `D:` that the title uses for game files.
 - **GPU:** developed on AMD RDNA4. The console's geometry and NGG programs run as a compute pass plus a
   mesh pass, so a GPU without mesh shaders draws none of them. On GPUs with 32-lane waves only
   (NVIDIA) console wave64 compute, geometry and mesh programs run as two 32-lane halves that exchange

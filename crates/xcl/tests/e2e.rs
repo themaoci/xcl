@@ -85,6 +85,57 @@ fn launcher_uses_configured_exe_in_an_ambiguous_folder() {
 }
 
 #[test]
+fn title_loads_host_dxc_under_a_console_mount() {
+    use xcl::gpu::recomp::dxc;
+
+    // The file hooks and DXC loader are process-wide. Both children use the same SDK and cache.
+    const CHILD: &str = "XCL_TEST_HOST_DXC";
+    let Ok(mode) = std::env::var(CHILD) else {
+        let Ok(dir) = dxc::location() else {
+            xcl::gpu::recomp::runner::skip_test("no DXC");
+            return;
+        };
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("xcl-host-dxc-{}-{nonce}", std::process::id()));
+        let sdk = root.join("sdk");
+        std::fs::create_dir_all(&sdk).unwrap();
+        std::fs::copy(dir.join("dxcompiler.dll"), sdk.join("dxcompiler.dll")).unwrap();
+        if dir.join("dxil.dll").is_file() {
+            std::fs::copy(dir.join("dxil.dll"), sdk.join("dxil.dll")).unwrap();
+        }
+        for mode in ["mounted", "native"] {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "title_loads_host_dxc_under_a_console_mount", "--nocapture"])
+                .env(CHILD, mode)
+                .env("XCL_DXC_DIR", &sdk)
+                .output().unwrap();
+            if !output.status.success() {
+                std::fs::remove_dir_all(&root).unwrap();
+                panic!("{mode} DXC child failed:\n{}", String::from_utf8_lossy(&output.stderr));
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+        return;
+    };
+
+    let sdk = PathBuf::from(std::env::var_os("XCL_DXC_DIR").unwrap());
+    let root = sdk.parent().unwrap();
+    let dll = sdk.join("dxcompiler.dll");
+    if mode == "mounted" {
+        let game = root.join("empty-title");
+        let mounts = vec![(sdk.display().to_string(), game.display().to_string())];
+        xcl::vfs::init(xcl::vfs::Vfs::new(&game, &root.join("title-data"), mounts));
+        xcl::vfs_hooks::install().unwrap();
+        assert!(!dll.is_file(), "the title should see the empty mount");
+    }
+    assert_eq!(dxc::location().unwrap(), sdk);
+    let (dxil, hit) = dxc::compile_cached_in(&root.join("cache"), "float4 main() : SV_Target { return 1; }", "main", "ps_6_0").unwrap();
+    assert!(dxil.starts_with(b"DXBC"));
+    assert_eq!(hit, mode == "native", "both processes should fingerprint the same SDK");
+    assert_eq!(dll.is_file(), mode == "native", "the mount should still apply outside the compiler");
+}
+
+#[test]
 fn test_title_runs_and_game_folder_is_untouched() {
     let xcl = PathBuf::from(env!("CARGO_BIN_EXE_xcl"));
     let bin_dir = xcl.parent().unwrap();

@@ -292,7 +292,7 @@ pub fn location() -> Result<&'static Path, String> {
 }
 
 fn load() -> Result<&'static (PathBuf, usize), String> {
-    LIB.get_or_init(|| {
+    LIB.get_or_init(|| crate::vfs_hooks::with_host_io(|| {
         use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
         for dir in candidates() {
             let dxc = dir.join("dxcompiler.dll");
@@ -323,7 +323,7 @@ fn load() -> Result<&'static (PathBuf, usize), String> {
             }
         }
         Err("dxcompiler.dll not found (set XCL_DXC_DIR or install the Windows SDK)".into())
-    })
+    }))
     .as_ref()
     .map_err(|e| e.clone())
 }
@@ -516,7 +516,7 @@ pub(super) fn toolchain_identity() -> &'static str {
                 h ^= byte as u64;
                 h = h.wrapping_mul(0x100_0000_01b3);
             }
-            let Ok(metadata) = std::fs::metadata(dir.join(name)) else {
+            let Ok(metadata) = crate::vfs_hooks::with_host_io(|| std::fs::metadata(dir.join(name))) else {
                 h ^= 0xff;
                 h = h.wrapping_mul(0x100_0000_01b3);
                 continue;
