@@ -2572,6 +2572,20 @@ impl Em {
         s
     }
 
+    /// abs / neg of source `i` on the sign bit (`sign` = 0x80000000u, or 0x8000u for an f16 in
+    /// the low half): abs clears it, then neg flips it. The value stays bits, so a NaN keeps its
+    /// payload and a denormal passes through, as on the hardware for a move or a select.
+    fn sign_mods(m: &Mods, i: usize, u: &str, sign: u32) -> String {
+        let mut s = u.to_string();
+        if m.abs[i] {
+            s = format!("({s} & {:#X}u)", sign - 1);
+        }
+        if m.neg[i] {
+            s = format!("({s} ^ {sign:#X}u)");
+        }
+        s
+    }
+
     /// Float result with output modifiers, as u32.
     fn fres(m: &Mods, e: &str) -> String {
         format!("asuint({})", Self::out_mods(m, e))
@@ -3145,7 +3159,7 @@ impl Em {
                     "v_min_f64" => format!("min({}, {})", f64v(0), f64v(1)),
                     "v_max_f64" => format!("max({}, {})", f64v(0), f64v(1)),
                     "v_rcp_f64" => format!("(1.0 / {})", f64v(0)),
-                    "v_cvt_f64_f32" => format!("(double)asfloat({})", lo_hi[0].0),
+                    "v_cvt_f64_f32" => format!("(double)asfloat({})", Self::sign_mods(&m, 0, &lo_hi[0].0, 0x8000_0000)),
                     "v_cvt_f64_i32" => format!("(double)(int){}", lo_hi[0].0),
                     "v_cvt_f64_u32" => format!("(double){}", lo_hi[0].0),
                     "v_floor_f64" => format!("floor_d({})", f64v(0)),
@@ -3268,7 +3282,7 @@ impl Em {
         let fr = |e: String| Self::fres(&m, &e);
         let wmask = if self.opt.wave64 { 63 } else { 31 };
         let res: String = match name {
-            "v_mov_b32" | "v_mov_fed_b32" => a.clone(),
+            "v_mov_b32" | "v_mov_fed_b32" => Self::sign_mods(&m, 0, &a, 0x8000_0000),
             "v_not_b32" => format!("~{a}"),
             "v_bfrev_b32" => format!("reversebits({a})"),
             "v_ffbh_u32" => format!("(({a}) == 0u ? 0xFFFFFFFFu : 31u - firstbithigh({a}))"),
@@ -3286,7 +3300,7 @@ impl Em {
             "v_cvt_f32_ubyte3" => fr(format!("(float)({a} >> 24)")),
             "v_cvt_f32_f16" => {
                 let h = if m.opsel & 1 == 1 { format!("({a} >> 16)") } else { format!("({a} & 0xFFFFu)") };
-                fr(format!("f16tof32({h})"))
+                fr(format!("f16tof32({})", Self::sign_mods(&m, 0, &h, 0x8000)))
             }
             "v_cvt_f16_f32" => {
                 // the modifiers in f32 before the rounding: the same f16 (scaling by a power of
@@ -3479,7 +3493,7 @@ impl Em {
             "v_cndmask_b32" => {
                 let (l, h) = u.get(2).ok_or("mask")?.split_once('|').ok_or("mask")?;
                 let bit = self.lane_of(l, h);
-                format!("select({bit}, {b}, {a})")
+                format!("select({bit}, {}, {})", Self::sign_mods(&m, 1, &b, 0x8000_0000), Self::sign_mods(&m, 0, &a, 0x8000_0000))
             }
             "v_permlane16_b32" | "v_permlanex16_b32" => {
                 // lane i of each row reads lane sel[i] of the same / the other row (32-lane halves)
