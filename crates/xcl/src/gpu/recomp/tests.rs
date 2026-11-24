@@ -8975,6 +8975,159 @@ fn gpu_fma_legacy_zero_product_adds_plus_zero() {
     }
 }
 
+#[test]
+fn qsad_and_mqsad_operand_forms_and_validation() {
+    let vop3 = |name: &str, f: &[(&str, u64)]| encode(name, "ENC_VOP3", f, None).unwrap();
+    let end = || encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap();
+    // Valid LLVM GFX10 operand combinations: VGPR pairs/quads (up to v255), SGPR pairs, VCC, EXEC, 0, -1, CLAMP.
+    let mut valid = Vec::new();
+    for name in ["V_QSAD_PK_U16_U8", "V_MQSAD_PK_U16_U8"] {
+        valid.extend(vop3(name, &[("VDST", 254), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 3)]));
+        valid.extend(vop3(name, &[("VDST", 4), ("SRC0", 2), ("SRC1", 103), ("SRC2", 126), ("CLAMP", 1)]));
+        valid.extend(vop3(name, &[("VDST", 6), ("SRC0", 193), ("SRC1", 128), ("SRC2", 106)]));
+        valid.extend(vop3(name, &[("VDST", 8), ("SRC0", 128), ("SRC1", 193), ("SRC2", 193)]));
+    }
+    valid.extend(vop3("V_MQSAD_U32_U8", &[("VDST", 252), ("SRC0", 193), ("SRC1", V + 2), ("SRC2", V + 3)]));
+    valid.extend(vop3("V_MQSAD_U32_U8", &[("VDST", 12), ("SRC0", 126), ("SRC1", 106), ("SRC2", V + 20), ("CLAMP", 1)]));
+    valid.extend(end());
+    let t = translate(&valid, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
+    if super::dxc::location().is_ok() {
+        super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+    }
+
+    // Invalid VGPR bounds / non-VGPR SRC2 on v_mqsad_u32_u8 must be rejected cleanly.
+    for bad in [
+        &[("VDST", 255), ("SRC0", V), ("SRC1", V + 2), ("SRC2", V + 3)][..],
+        &[("VDST", 4), ("SRC0", V + 255), ("SRC1", V + 2), ("SRC2", V + 3)],
+        &[("VDST", 4), ("SRC0", V), ("SRC1", V + 2), ("SRC2", V + 255)],
+    ] {
+        let mut p = vop3("V_QSAD_PK_U16_U8", bad);
+        p.extend(end());
+        assert!(!translate(&p, &Options::default()).unwrap().complete(), "{bad:?}");
+    }
+    for bad in [
+        &[("VDST", 253), ("SRC0", V), ("SRC1", V + 2), ("SRC2", V + 3)][..],
+        &[("VDST", 4), ("SRC0", V), ("SRC1", V + 2), ("SRC2", 0)],
+        &[("VDST", 4), ("SRC0", V), ("SRC1", V + 2), ("SRC2", 128)],
+        &[("VDST", 4), ("SRC0", V), ("SRC1", V + 2), ("SRC2", V + 253)],
+    ] {
+        let mut p = vop3("V_MQSAD_U32_U8", bad);
+        p.extend(end());
+        assert!(!translate(&p, &Options::default()).unwrap().complete(), "{bad:?}");
+    }
+}
+
+/// GPU verification of `v_qsad_pk_u16_u8`, `v_mqsad_pk_u16_u8`, and `v_mqsad_u32_u8`: sliding
+/// windows across `S0[63:0]`, zero-byte masking on `S1`, wrapping vs `CLAMP` saturation,
+/// SGPR/inline sources, overlapping `VDST`/`SRC` ranges, and `EXEC` masking.
+#[test]
+fn gpu_qsad_and_mqsad() {
+    if !gpu_ready() {
+        return;
+    }
+    let vop3 = |name: &str, f: &[(&str, u64)]| encode(name, "ENC_VOP3", f, None).unwrap();
+    let run_on = |code: &[u8], st: &KernelState, wave64: bool| {
+        let t = translate(code, &on_gpu(Options { wave64, ..Default::default() })).unwrap();
+        assert!(t.complete(), "wave64={wave64}: {:?}", t.unsupported_why);
+        let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        runner::run(&dxil, st, &[]).unwrap()
+    };
+    let mut code = Vec::new();
+    // Unmasked vs masked sliding windows (v4 = 0x4000_2015 has zero byte 2; v3 top byte 0xFF unused)
+    code.extend(vop3("V_QSAD_PK_U16_U8", &[("VDST", 8), ("SRC0", V + 2), ("SRC1", V + 4), ("SRC2", V + 6)]));
+    code.extend(vop3("V_QSAD_PK_U16_U8", &[("VDST", 12), ("SRC0", V + 2), ("SRC1", V + 4), ("SRC2", V + 10)]));
+    code.extend(vop3("V_QSAD_PK_U16_U8", &[("VDST", 14), ("SRC0", V + 2), ("SRC1", V + 4), ("SRC2", V + 10), ("CLAMP", 1)]));
+    code.extend(vop3("V_MQSAD_PK_U16_U8", &[("VDST", 16), ("SRC0", V + 2), ("SRC1", V + 4), ("SRC2", V + 6)]));
+    code.extend(vop3("V_MQSAD_PK_U16_U8", &[("VDST", 18), ("SRC0", V + 2), ("SRC1", V + 4), ("SRC2", V + 10), ("CLAMP", 1)]));
+    // Inline -1 SRC0, SGPR SRC1 (s2) and SGPR pair SRC2 (s[4:5])
+    code.extend(vop3("V_MQSAD_PK_U16_U8", &[("VDST", 20), ("SRC0", 193), ("SRC1", 2), ("SRC2", 4)]));
+    // 128-bit accumulator wrap vs CLAMP saturation
+    code.extend(vop3("V_MQSAD_U32_U8", &[("VDST", 26), ("SRC0", V + 2), ("SRC1", V + 4), ("SRC2", V + 22)]));
+    code.extend(vop3("V_MQSAD_U32_U8", &[("VDST", 30), ("SRC0", V + 2), ("SRC1", V + 4), ("SRC2", V + 22), ("CLAMP", 1)]));
+    // Overlapping VDST/SRC0/SRC2 (in-place pk and staggered v[36:39] <- v[37:40])
+    code.extend(vop3("V_MQSAD_PK_U16_U8", &[("VDST", 34), ("SRC0", V + 34), ("SRC1", V + 4), ("SRC2", V + 34)]));
+    code.extend(vop3("V_MQSAD_U32_U8", &[("VDST", 36), ("SRC0", V + 2), ("SRC1", V + 4), ("SRC2", V + 37)]));
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+
+    let mut st = KernelState::default();
+    st.sgpr[2] = 0x00FF_0001;
+    st.sgpr[4] = 0x0002_0001;
+    st.sgpr[5] = 0x0004_0003;
+    for r in &mut st.vgpr {
+        r[2] = 0x4030_2010;
+        r[3] = 0xFF60_5000;
+        r[4] = 0x4000_2015;
+        r[6] = 0x0002_0001;
+        r[7] = 0x0004_0003;
+        r[10] = 0x0001_FFFE;
+        r[11] = 0x0100_FFE0;
+        r[22] = 0xFFFF_FFFC;
+        r[23] = 0xFFFF_FFA0;
+        r[24] = 0xFFFF_FFFF;
+        r[25] = 5;
+        r[34] = 0x4030_2010;
+        r[35] = 0xFF60_5000;
+        r[37] = 10;
+        r[38] = 20;
+        r[39] = 30;
+        r[40] = 40;
+    }
+
+    for (wave64, lanes) in [(false, 32usize), (true, 64usize)] {
+        let r = run_on(&code, &st, wave64);
+        for (l, v) in r.vgpr.iter().enumerate().take(lanes) {
+            assert_eq!((v[8], v[9]), (54 | (157 << 16), 78 | (191 << 16)), "wave64={wave64} lane {l}: v_qsad_pk_u16_u8");
+            assert_eq!((v[12], v[13]), (51 | (156 << 16), 43 | (443 << 16)), "wave64={wave64} lane {l}: v_qsad_pk_u16_u8 wrap");
+            assert_eq!((v[14], v[15]), (0xFFFF | (156 << 16), 0xFFFF | (443 << 16)), "wave64={wave64} lane {l}: v_qsad_pk_u16_u8 clamp");
+            assert_eq!((v[16], v[17]), (6 | (93 << 16), 78 | (111 << 16)), "wave64={wave64} lane {l}: v_mqsad_pk_u16_u8");
+            assert_eq!((v[18], v[19]), (0xFFFF | (92 << 16), 0xFFFF | (363 << 16)), "wave64={wave64} lane {l}: v_mqsad_pk_u16_u8 clamp");
+            assert_eq!((v[20], v[21]), (255 | (256 << 16), 257 | (258 << 16)), "wave64={wave64} lane {l}: v_mqsad_pk_u16_u8 -1/SGPR");
+            assert_eq!((v[26], v[27], v[28], v[29]), (1, 0xFFFF_FFFB, 74, 112), "wave64={wave64} lane {l}: v_mqsad_u32_u8 wrap");
+            assert_eq!((v[30], v[31], v[32], v[33]), (u32::MAX, 0xFFFF_FFFB, u32::MAX, 112), "wave64={wave64} lane {l}: v_mqsad_u32_u8 clamp");
+            assert_eq!((v[34], v[35]), (0x408B_2015, 0xFFCB_504B), "wave64={wave64} lane {l}: overlapping pk");
+            assert_eq!((v[36], v[37], v[38], v[39], v[40]), (15, 111, 105, 147, 40), "wave64={wave64} lane {l}: staggered u32");
+        }
+    }
+
+    // EXEC masking (32-lane and split/native 64-lane) + VCC pair as SRC2: inactive lanes keep old VDST.
+    let mut masked = Vec::new();
+    masked.extend(vop3("V_MQSAD_PK_U16_U8", &[("VDST", 0), ("SRC0", 193), ("SRC1", 129), ("SRC2", 128)]));
+    masked.extend(vop3("V_MQSAD_U32_U8", &[("VDST", 2), ("SRC0", 193), ("SRC1", 129), ("SRC2", V + 2)]));
+    masked.extend(vop3("V_QSAD_PK_U16_U8", &[("VDST", 6), ("SRC0", 193), ("SRC1", 129), ("SRC2", 106)]));
+    masked.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let mut ms = KernelState::default();
+    ms.sgpr[106] = 0x0002_0001;
+    ms.sgpr[107] = 0x0004_0003;
+    ms.sgpr[126] = 0x00FF_00FF;
+    ms.sgpr[127] = 0x0F0F_0F0F;
+    for r in &mut ms.vgpr {
+        r[0] = 0xAAAA_AAAA;
+        r[1] = 0xBBBB_BBBB;
+        r[2] = 11;
+        r[3] = 22;
+        r[4] = 33;
+        r[5] = 44;
+        r[6] = 0xCCCC_CCCC;
+        r[7] = 0xDDDD_DDDD;
+    }
+    for (wave64, lanes) in [(false, 32usize), (true, 64usize)] {
+        let r = run_on(&masked, &ms, wave64);
+        for (l, v) in r.vgpr.iter().enumerate().take(lanes) {
+            let active = ((if l < 32 { ms.sgpr[126] } else { ms.sgpr[127] }) >> (l & 31)) & 1 != 0;
+            if active {
+                assert_eq!((v[0], v[1]), (0x00FE_00FE, 0x00FE_00FE), "wave64={wave64} active lane {l} pk");
+                assert_eq!((v[2], v[3], v[4], v[5]), (265, 276, 287, 298), "wave64={wave64} active lane {l} u32");
+                assert_eq!((v[6], v[7]), (1020 | (1021 << 16), 1022 | (1023 << 16)), "wave64={wave64} active lane {l} vcc");
+            } else {
+                assert_eq!((v[0], v[1]), (0xAAAA_AAAA, 0xBBBB_BBBB), "wave64={wave64} inactive lane {l} pk");
+                assert_eq!((v[2], v[3], v[4], v[5]), (11, 22, 33, 44), "wave64={wave64} inactive lane {l} u32");
+                assert_eq!((v[6], v[7]), (0xCCCC_CCCC, 0xDDDD_DDDD), "wave64={wave64} inactive lane {l} vcc");
+            }
+        }
+    }
+}
+
 /// `XCL_SAMPLE_FSPX=<folder>`: every `*.bin` there that is an FSPX (driver) compute container –
 /// e.g. the FSR4 pipelines XCL dumps to `<data>\shaders` – translates and compiles.
 #[test]

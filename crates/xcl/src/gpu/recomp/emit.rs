@@ -3084,6 +3084,73 @@ impl Em {
         Ok(())
     }
 
+    /// Quad-byte SAD (`v_qsad_pk_u16_u8`, `v_mqsad_pk_u16_u8`, `v_mqsad_u32_u8`): slides the
+    /// 4-byte pattern in `SRC1` across bytes 0..3, 1..4, 2..5, 3..6 of `SRC0` (skipping bytes
+    /// where `SRC1`'s byte is zero for `mqsad`) and adds into `SRC2`, saturating per element
+    /// when `CLAMP` is set.
+    fn valu_qsad(&mut self, d: &Decoded, name: &str) -> Result<(), &'static str> {
+        if d.variant != Variant::Plain {
+            return Err("quad-SAD SDWA/DPP");
+        }
+        let (outs, ins) = Self::ops(d);
+        let clamp = Self::mods(d).clamp;
+        let masked = name.starts_with("v_mqsad");
+        let wide = name == "v_mqsad_u32_u8";
+        let dst = outs.first().map(|o| Self::dst_of(d, o)).unwrap_or(Dst::Null);
+        let limit = if wide { 252 } else { 254 };
+        if matches!(dst, Dst::V(n) if n > limit) {
+            return Err("quad-SAD VDST out of range");
+        }
+        let (s0_lo, s0_hi) = self.read64(d, ins.first().ok_or("op")?, false).ok_or("op")?;
+        let s1 = self.read(d, ins.get(1).ok_or("op")?, false).ok_or("op")?;
+        let s2_op = ins.get(2).ok_or("op")?;
+        let sad = if masked { "msad_u8" } else { "sad_u8" };
+        let t = self.t();
+        self.line(&format!("uint {t}_l = {s0_lo}; uint {t}_h = {s0_hi}; uint {t}_r = {s1};"));
+        let wins = [
+            format!("{t}_l"),
+            format!("(({t}_l >> 8) | ({t}_h << 24))"),
+            format!("(({t}_l >> 16) | ({t}_h << 16))"),
+            format!("(({t}_l >> 24) | ({t}_h << 8))"),
+        ];
+        if wide {
+            let f = s2_op.field.ok_or("op")?;
+            let code = Self::field(d, f);
+            if !(256..=508).contains(&code) {
+                return Err("quad-SAD SRC2 not a 4-VGPR range");
+            }
+            let base = code - 256;
+            for (i, w) in wins.iter().enumerate() {
+                let acc = self.vreg(base + i as u64);
+                let sum = format!("{sad}({w}, {t}_r)");
+                let expr = if clamp { format!("sat_u32((uint64_t){sum} + (uint64_t){acc})") } else { format!("{sum} + {acc}") };
+                self.line(&format!("uint {t}_{i} = {expr};"));
+            }
+            if let Dst::V(dn) = dst {
+                let act = self.act();
+                let writes: Vec<String> = (0..4)
+                    .map(|i| {
+                        let vd = self.vreg(dn + i as u64);
+                        format!("{vd} = select({act}, {t}_{i}, {vd});")
+                    })
+                    .collect();
+                self.line(&writes.join(" "));
+            }
+        } else {
+            let (a_lo, a_hi) = self.read64(d, s2_op, false).ok_or("op")?;
+            self.line(&format!(
+                "uint {t}_0 = pk_sad_u16({sad}({}, {t}_r), {sad}({}, {t}_r), {a_lo}, {clamp});",
+                wins[0], wins[1]
+            ));
+            self.line(&format!(
+                "uint {t}_1 = pk_sad_u16({sad}({}, {t}_r), {sad}({}, {t}_r), {a_hi}, {clamp});",
+                wins[2], wins[3]
+            ));
+            self.write64(&dst, &format!("{t}_0"), &format!("{t}_1"));
+        }
+        Ok(())
+    }
+
     /// 16-bit VALU (f16 / u16 / i16 / b16): sources are the low halves (VOP3 op_sel picks the
     /// high half per source), results go to the low half (op_sel[3]: high half) and the other
     /// half is preserved – AnyPS5 `write16Bits` (GPL-2.0, ported 2026-11-20).
@@ -3403,6 +3470,9 @@ impl Em {
         let mix = name.starts_with("v_fma_mix");
         if name.starts_with("v_pk_") || name.starts_with("v_dot") {
             return self.valu_pk(d, name);
+        }
+        if matches!(name, "v_qsad_pk_u16_u8" | "v_mqsad_pk_u16_u8" | "v_mqsad_u32_u8") {
+            return self.valu_qsad(d, name);
         }
         if name.starts_with("v_movrel") {
             return self.movrel(d, name);
@@ -5985,6 +6055,7 @@ uint absd8(uint a, uint b, uint k) { uint x = (a >> k) & 0xFFu; uint y = (b >> k
 uint absd16(uint a, uint b, uint k) { uint x = (a >> k) & 0xFFFFu; uint y = (b >> k) & 0xFFFFu; return max(x, y) - min(x, y); }
 uint sad_u8(uint a, uint b) { return absd8(a, b, 0u) + absd8(a, b, 8u) + absd8(a, b, 16u) + absd8(a, b, 24u); }
 uint msad_u8(uint a, uint b) { return select((b & 0xFFu) != 0u, absd8(a, b, 0u), 0u) + select(((b >> 8) & 0xFFu) != 0u, absd8(a, b, 8u), 0u) + select(((b >> 16) & 0xFFu) != 0u, absd8(a, b, 16u), 0u) + select((b >> 24) != 0u, absd8(a, b, 24u), 0u); }
+uint pk_sad_u16(uint d0, uint d1, uint acc, bool sat) { uint s0 = (acc & 0xFFFFu) + d0; uint s1 = (acc >> 16) + d1; return select(sat, min(s0, 0xFFFFu), s0 & 0xFFFFu) | (select(sat, min(s1, 0xFFFFu), s1 & 0xFFFFu) << 16); }
 uint lerp8(uint a, uint b, uint c, uint k) { return ((((a >> k) & 0xFFu) + ((b >> k) & 0xFFu) + ((c >> k) & 1u)) >> 1) << k; }
 uint lerp_u8(uint a, uint b, uint c) { return lerp8(a, b, c, 0u) | lerp8(a, b, c, 8u) | lerp8(a, b, c, 16u) | lerp8(a, b, c, 24u); }
 uint sat_u32(uint64_t r) { return select(r > (uint64_t)0xFFFFFFFFu, 0xFFFFFFFFu, (uint)r); }
