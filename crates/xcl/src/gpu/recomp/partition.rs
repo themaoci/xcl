@@ -640,19 +640,31 @@ fn leaves_nothing(insts: &[Decoded], g: &Cfg, b: usize) -> bool {
         })
 }
 
-/// The first instruction of block `b` narrows EXEC to the lanes of the mask in `m`
-/// (`s_and_saveexec_b64 s, m`, `s_and_b64 exec, m, x` / `x, m`, `s_mov_b64` / `s_wqm_b64 exec, m`).
-fn narrows_exec_by(insts: &[Decoded], g: &Cfg, b: usize, m: usize) -> bool {
-    let Some(d) = g.range(b).next().map(|i| &insts[i]) else { return false };
-    let f = |name: &str| rdna2::field_value(d.enc, &d.words, name);
-    match d.inst.name {
-        "S_AND_SAVEEXEC_B64" => f("SSRC0") == Some(m as u64),
-        // (the whole-quad form: the quads of the mask's pixels, helpers included)
-        "S_MOV_B64" | "S_WQM_B64" => f("SDST") == Some(EXEC as u64) && f("SSRC0") == Some(m as u64),
-        // EXEC = m & anything: no lane outside m runs this side
-        "S_AND_B64" => f("SDST") == Some(EXEC as u64) && (f("SSRC0") == Some(m as u64) || f("SSRC1") == Some(m as u64)),
-        _ => false,
+/// Block `b`, a vote's side, turns EXEC off in a half whose mask is empty before it does any lane
+/// work: from what that half knows at the vote (`at_vote`), EXEC is zero in it once the block's
+/// leading scalar instructions are done (`s_and_saveexec_b64 s, m`, `s_wqm_b64 exec, m`, or a
+/// compiler's `s_wqm_b64 s, m; s_and_b64 exec, exec, s`). Before that only scalar ALU ops, scalar
+/// loads and waits: their writes are the wave's, followed as stale where the sides join.
+fn narrows_before_lane_work(insts: &[Decoded], sw: &[u128], g: &Cfg, b: usize, at_vote: Half) -> bool {
+    let mut h = at_vote;
+    for i in g.range(b) {
+        if has_pair(h.z, EXEC) {
+            return true;
+        }
+        let d = &insts[i];
+        let n = d.inst.name;
+        let scalar = match d.enc.name {
+            "ENC_SOP1" | "ENC_SOP2" | "ENC_SOPC" | "ENC_SOPK" => !n.starts_with("S_SETREG") && !n.starts_with("S_GETREG") && !n.contains("PC_B64"),
+            "ENC_SMEM" => n.contains("LOAD"),
+            "ENC_SOPP" => n.starts_with("S_WAITCNT") || n == "S_NOP",
+            _ => false,
+        };
+        if !scalar {
+            return false;
+        }
+        zero_step(d, sw[i], &mut h);
     }
+    has_pair(h.z, EXEC)
 }
 
 /// Classify a wave64 VS / PS (instructions in address order, far jumps resolved).
@@ -849,10 +861,9 @@ fn vote(insts: &[Decoded], sw: &[u128], g: &Cfg, ipdom: &[PostDom], b: usize, d:
     let skips = joins || leaves_nothing(insts, g, empty);
     // … and keeps it narrowed: up to the join, or for a way out that ends the program, to the end
     // (a half whose mask is empty must not miss lanes the wave turns on again)
-    let narrows = match mask {
-        None => true,
-        Some(m) => narrows_exec_by(insts, g, run, m),
-    } && !widens_after(insts, sw, g, b, run, if joins { Some(empty) } else { None }, zero_at_vote(insts, sw, g, b, mask.unwrap_or(EXEC)), mask.is_none());
+    let at_vote = zero_at_vote(insts, sw, g, b, mask.unwrap_or(EXEC));
+    let narrows = (mask.is_none() || narrows_before_lane_work(insts, sw, g, run, at_vote))
+        && !widens_after(insts, sw, g, b, run, if joins { Some(empty) } else { None }, at_vote, mask.is_none());
     if !(skips && narrows) {
         out.insert(if mask.is_none() { "unsafe-execz-branch" } else { "vote-branch" });
     }
@@ -965,6 +976,36 @@ mod tests {
         const NULL: I = ("EXP", "ENC_EXP", &[("TGT", 9), ("EN", 0), ("VSRC0", 0), ("VSRC1", 0), ("VSRC2", 0), ("VSRC3", 0), ("DONE", 1), ("VM", 1)], None);
         let p: &[I] = &[SAVE, CMP, KILL, ("S_CBRANCH_SCC0", "ENC_SOPP", &[("SIMM16", 4)], None), LIVE, EXP, ("S_ENDPGM", "ENC_SOPP", &[], None), NULL];
         assert_eq!(reasons(p), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn a_discard_early_out_that_narrows_through_a_whole_quad_copy_is_exact() {
+        // as above, with the compiler's form of the narrowing: s[90:91] = wqm(s[88:89]) (and a
+        // scalar load), then exec &= s[90:91]
+        const SAVE: I = ("S_MOV_B64", "ENC_SOP1", &[("SDST", 88), ("SSRC0", EXEC as u64)], None);
+        const KILL: I = ("S_ANDN2_B64", "ENC_SOP2", &[("SDST", 88), ("SSRC0", 88), ("SSRC1", VCC as u64)], None);
+        const WQM: I = ("S_WQM_B64", "ENC_SOP1", &[("SDST", 90), ("SSRC0", 88)], None);
+        const LOAD: I = ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 20), ("SBASE", 2), ("OFFSET", 0), ("SOFFSET", 125)], None);
+        const LIVE: I = ("S_AND_B64", "ENC_SOP2", &[("SDST", EXEC as u64), ("SSRC0", EXEC as u64), ("SSRC1", 90)], None);
+        const NULL: I = ("EXP", "ENC_EXP", &[("TGT", 9), ("EN", 0), ("VSRC0", 0), ("VSRC1", 0), ("VSRC2", 0), ("VSRC3", 0), ("DONE", 1), ("VM", 1)], None);
+        const END: I = ("S_ENDPGM", "ENC_SOPP", &[], None);
+        // (branch offsets in dwords: a scalar load, an export and an imm32 are two)
+        let scc0 = |n: u64| -> I {
+            ("S_CBRANCH_SCC0", "ENC_SOPP", match n { 7 => &[("SIMM16", 7)], 6 => &[("SIMM16", 6)], _ => &[("SIMM16", 5)] }, None)
+        };
+        let p: &[I] = &[SAVE, CMP, KILL, scc0(7), WQM, LOAD, LIVE, EXP, END, NULL];
+        assert_eq!(reasons(p), Vec::<&str>::new());
+        // lane work before the narrowing: the half whose pixels are all discarded would skip it
+        let q: &[I] = &[SAVE, CMP, KILL, scc0(6), WQM, BODY, LIVE, EXP, END, NULL];
+        assert_eq!(reasons(q), vec!["vote-branch"]);
+        // a narrowing by a mask that is not the vote's (the compare's lanes: not empty in that half)
+        const OTHER: I = ("S_WQM_B64", "ENC_SOP1", &[("SDST", 90), ("SSRC0", VCC as u64)], None);
+        let r: &[I] = &[SAVE, CMP, KILL, scc0(5), OTHER, LIVE, EXP, END, NULL];
+        assert_eq!(reasons(r), vec!["vote-branch"]);
+        // a mode register written before the narrowing is the wave's, not the half's
+        const MODE: I = ("S_SETREG_IMM32_B32", "ENC_SOPK", &[("SIMM16", 1), ("SDST", 0)], Some(0));
+        let s: &[I] = &[SAVE, CMP, KILL, scc0(7), WQM, MODE, LIVE, EXP, END, NULL];
+        assert_eq!(reasons(s), vec!["vote-branch"]);
     }
 
     #[test]
