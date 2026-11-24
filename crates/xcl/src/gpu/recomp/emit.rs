@@ -5697,7 +5697,10 @@ uint fma_mix_f16_rm(float a, float b, float c, bool clamp, uint rm) {
     // value f32 holds (2^100 * 2^100 would convert to inf and lose RTZ's 65504; 2^-100 * 2^-100 to 0
     // and lose +inf's 2^-24), 2^17 and 2^-40 are exact in f32
     precise double sa = abs(s);
-    if (sa > 131072.0) s = select(s < 0.0, -131072.0, 131072.0);
+    // an infinite f32 source stays infinite whatever the mode: only a finite exact result
+    // beyond binary16's range is brought to 2^17 for the mode to decide (`isinf` can lower
+    // through a float conversion, so compare against the largest double instead)
+    if (sa > 131072.0 && sa < 1.7976931348623157e308) s = select(s < 0.0, -131072.0, 131072.0);
     if (sa < 9.094947017729282e-13) s = select(s < 0.0, -9.094947017729282e-13, 9.094947017729282e-13);
     precise float sf = (float)s;
     precise double r = (s - (double)sf) + e;
