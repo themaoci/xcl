@@ -8167,6 +8167,92 @@ fn gpu_ds_swizzle_and_bpermute_zero_inactive_lanes() {
     }
 }
 
+/// `ds_permute_b32` as RDNA2 hardware runs it (measured in native wave64 on RDNA2, #925 /
+/// #772): each active lane sends DATA0 to lane `((ADDR + offset) >> 2) & 31` of its own
+/// 32-lane half; of several senders the highest lane wins, a lane no one sends to gets 0,
+/// inactive lanes neither send nor receive.
+fn ds_permute_reference(lanes: usize, exec: u64, addr: &[u32], offset: u32, data: &[u32], old: u32) -> Vec<u32> {
+    let mut tmp = vec![0u32; lanes];
+    for i in 0..lanes {
+        if exec >> i & 1 == 1 {
+            tmp[(i & 32) | (addr[i].wrapping_add(offset) >> 2) as usize & 31] = data[i];
+        }
+    }
+    (0..lanes).map(|i| if exec >> i & 1 == 1 { tmp[i] } else { old }).collect()
+}
+
+#[test]
+fn gpu_ds_permute_b32() {
+    let run_case = |wave64: bool, split_wave64: bool| {
+        let lanes = if wave64 { 64 } else { 32 };
+        let exec: u64 = if wave64 { 0xF0F0_FF0F_7777_FFFE } else { 0x7777_FFFE };
+        let mut insns: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = vec![("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 255)], Some(exec as u32))];
+        if wave64 {
+            insns.push(("S_MOV_B32", "ENC_SOP1", &[("SDST", 127), ("SSRC0", 255)], Some((exec >> 32) as u32)));
+        }
+        insns.extend_from_slice(&[
+            // reversal: within each 32-lane half in wave64, not across them
+            ("DS_PERMUTE_B32", "ENC_DS", &[("VDST", 10), ("ADDR", 1), ("DATA0", 0)], None),
+            // two senders per lane (the higher wins), the upper lanes get nothing; high address bits ignored
+            ("DS_PERMUTE_B32", "ENC_DS", &[("VDST", 11), ("ADDR", 2), ("DATA0", 0)], None),
+            // the offset field moves every lane on by two, wrapping in its half
+            ("DS_PERMUTE_B32", "ENC_DS", &[("VDST", 12), ("ADDR", 3), ("DATA0", 0), ("OFFSET0", 8)], None),
+            // offset 128 = 32 lanes: the identity, it does not move a lane to the other half
+            ("DS_PERMUTE_B32", "ENC_DS", &[("VDST", 13), ("ADDR", 3), ("DATA0", 0), ("OFFSET0", 128)], None),
+        ]);
+        let code = prog(&insns);
+        let t = translate(&code, &Options { wave64, split_wave64, ..Default::default() }).unwrap();
+        assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
+        let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        let mut st = KernelState::default();
+        let (mut data, mut a1, mut a2, mut a3) = (vec![], vec![], vec![], vec![]);
+        for l in 0..lanes {
+            data.push(0x1000 + l as u32);
+            a1.push(4 * (lanes - 1 - l) as u32);
+            a2.push(4 * (l / 2) as u32 + 0x0001_0000);
+            a3.push(4 * l as u32);
+        }
+        for (l, r) in st.vgpr.iter_mut().take(lanes).enumerate() {
+            (r[0], r[1], r[2], r[3]) = (data[l], a1[l], a2[l], a3[l]);
+            for dst in 10..=13 {
+                r[dst] = 0xCAFE_BABE;
+            }
+        }
+        let r = runner::run(&dxil, &st, &[]).unwrap();
+        let want = [
+            ds_permute_reference(lanes, exec, &a1, 0, &data, 0xCAFE_BABE),
+            ds_permute_reference(lanes, exec, &a2, 0, &data, 0xCAFE_BABE),
+            ds_permute_reference(lanes, exec, &a3, 8, &data, 0xCAFE_BABE),
+            ds_permute_reference(lanes, exec, &a3, 128, &data, 0xCAFE_BABE),
+        ];
+        for l in 0..lanes {
+            for (k, w) in want.iter().enumerate() {
+                assert_eq!(r.vgpr[l][10 + k], w[l], "wave{lanes} split={split_wave64} lane {l}: v{}", 10 + k);
+            }
+        }
+    };
+    for wave64 in gpu_waves() {
+        run_case(wave64, false);
+    }
+    if gpu_ready() {
+        run_case(true, true);
+    }
+}
+
+/// `ds_permute_b32` is refused in a wave64 VS / PS that may run in 32-lane waves (lanes 32..63
+/// of the console wave do not exist there), and translated in compute.
+#[test]
+fn ds_permute_b32_refused_where_upper_lanes_do_not_exist() {
+    let code = prog(&[("DS_PERMUTE_B32", "ENC_DS", &[("VDST", 10), ("ADDR", 1), ("DATA0", 0)], None)]);
+    let ps = Mode::Pixel(super::PsInterface { inputs: vec![], outputs: vec![], input_ena: 0x7F, attrs: None });
+    let t = translate(&code, &Options { mode: ps.clone(), wave64: true, split_wave64: true, ..Default::default() }).unwrap();
+    assert_eq!(t.unsupported.get("ds_permute_b32"), Some(&1), "{:?}", t.unsupported);
+    let t = translate(&code, &Options { mode: ps, wave64: true, split_wave64: false, ..Default::default() }).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    let t = translate(&code, &Options { wave64: true, split_wave64: true, ..Default::default() }).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+}
+
 #[test]
 fn gpu_ldexp_f32() {
     for wave64 in gpu_waves() {

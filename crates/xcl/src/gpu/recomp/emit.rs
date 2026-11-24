@@ -4172,6 +4172,31 @@ impl Em {
                 self.write32(&dst, &t);
                 return Ok(());
             }
+            // forward permute: each active lane sends DATA0 to lane ((ADDR + offset) >> 2) & 31
+            // of its own 32-lane half – in wave64 too, as measured on RDNA2 (#925, #772: like
+            // ds_bpermute there, it never crosses the halves); of several senders to one lane
+            // the highest wins, a lane nobody sends to gets 0 (no LDS memory is used). The
+            // receiver looks at the 32 senders of its half in lane order, so the split wave64
+            // form needs no exchange (`rla_half_fn`, as ds_swizzle).
+            "ds_permute_b32" => {
+                if self.opt.wave64 && self.opt.split_wave64 && matches!(self.opt.mode, Mode::Vertex(_) | Mode::Pixel(_)) {
+                    // a 32-lane wave stands for a console wave whose lanes 32..63 do not exist
+                    return Err("ds_permute_b32 in a wave64 VS / PS that may run in 32-lane waves");
+                }
+                let (a, v) = (self.vreg(f("ADDR")), self.vreg(f("DATA0")));
+                let (el, eh) = (self.sreg(126), self.sreg(127));
+                let eh = if self.opt.wave64 { eh } else { "0u".into() };
+                let rla = self.rla_half_fn();
+                self.line(&format!("uint {t}_a = {a} + {off16}u;"));
+                self.line(&format!("uint {t} = 0u, {t}_h = lane_id & 0x20u;"));
+                self.line(&format!("[loop] for (uint {t}_k = 0u; {t}_k < 32u; {t}_k++) {{"));
+                self.line(&format!("    uint {t}_s = {t}_h | {t}_k, {t}_sa = {rla}({t}_a, {t}_s), {t}_sd = {rla}({v}, {t}_s);"));
+                self.line(&format!("    if (lanebit_at({el}, {eh}, {t}_s) && (({t}_sa >> 2) & 31u) == (lane_id & 31u)) {t} = {t}_sd;"));
+                self.line("}");
+                let dst = Dst::V(f("VDST"));
+                self.write32(&dst, &t);
+                return Ok(());
+            }
             _ => {}
         }
         if !matches!(self.opt.mode, Mode::Kernel | Mode::Mesh(_) | Mode::Geometry(_) | Mode::Compute(_)) {
