@@ -573,9 +573,36 @@ impl State {
         self.windows.iter().position(|(b, _)| a >= *b && a < *b + crate::gpu::uma::WINDOW)
     }
 
+    /// Register `heap` as a pool (reusing a given-back pool slot) and fill `free` with its
+    /// tiles; returns the pool index.
+    fn adopt_pool(&mut self, heap: ID3D12Heap) -> u32 {
+        let h = match self.pools.iter().position(|p| p.is_none()) {
+            Some(i) => {
+                self.pools[i] = Some(heap);
+                i as u32
+            }
+            None => {
+                self.pools.push(Some(heap));
+                self.pools.len() as u32 - 1
+            }
+        };
+        self.free.extend((1..POOL_TILES).rev().map(|t| (h, t)));
+        h
+    }
+
     unsafe fn take_tile(&mut self) -> Option<((u32, u32), bool)> {
         if let Some(t) = self.free.pop() {
             return Some((t, true));
+        }
+        // A retired pool whose work is complete comes back before the driver is asked for
+        // another 64 MB: freeing the last tile of a pool and allocating again within the
+        // retirement hold otherwise creates a new heap on every cycle (#913).
+        let done = self.fence.GetCompletedValue();
+        if let Some(i) = self.retired.iter().position(|(_, v, _)| done >= *v) {
+            let (heap, _, _) = self.retired.remove(i);
+            let h = self.adopt_pool(heap);
+            // the heap was in use before: its tiles are not fresh and are zeroed on mapping
+            return Some(((h, 0), true));
         }
         let desc = D3D12_HEAP_DESC {
             SizeInBytes: POOL_TILES as u64 * TILE as u64,
@@ -589,17 +616,7 @@ impl State {
             return None;
         }
         let heap = heap?;
-        let h = match self.pools.iter().position(|p| p.is_none()) {
-            Some(i) => {
-                self.pools[i] = Some(heap);
-                i as u32
-            }
-            None => {
-                self.pools.push(Some(heap));
-                self.pools.len() as u32 - 1
-            }
-        };
-        self.free.extend((1..POOL_TILES).rev().map(|t| (h, t)));
+        let h = self.adopt_pool(heap);
         Some(((h, 0), false))
     }
 
@@ -1529,6 +1546,75 @@ mod tests {
             .collect();
         for t in threads {
             t.join().unwrap();
+        }
+    }
+
+    /// Freeing the last tile of a pool and allocating again within the retirement hold must not
+    /// ask the driver for another 64 MiB heap: the retired pool comes back instead (#913).
+    #[test]
+    fn a_retired_pool_comes_back_before_a_new_heap_is_created() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::*;
+
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let warp: IDXGIAdapter = factory.EnumWarpAdapter().expect("WARP");
+                D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
+            }
+            let dev = dev.expect("D3D12 device");
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("queue");
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
+            let rb_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("rb_fence");
+            let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None).expect("event");
+            let rb_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("rb_alloc");
+            let rb_list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &rb_alloc, None).expect("rb_list");
+            rb_list.Close().expect("rb_list close");
+            let mut s = State {
+                dev,
+                queue,
+                fence,
+                value: 0,
+                event,
+                rb_fence,
+                rb_value: 0,
+                windows: Vec::new(),
+                pools: Vec::new(),
+                free: Vec::new(),
+                retired: Vec::new(),
+                mapped: FxHashMap::default(),
+                pinned: FxHashMap::default(),
+                buffers: FxHashMap::default(),
+                to_zero: Vec::new(),
+                staging: None,
+                ring_write: 0,
+                ring_submitted: 0,
+                ring_free: 0,
+                inflight: VecDeque::new(),
+                zero_buf: None,
+                slots: Vec::new(),
+                next_slot: 0,
+                readback: None,
+                rb_alloc,
+                rb_list,
+                rb_last_fence: 0,
+                waited: FxHashMap::default(),
+                runs: None,
+                scratch_runs: Vec::new(),
+            };
+
+            let ((pool, tile), reused) = s.take_tile().expect("a pool tile");
+            assert_eq!((pool, s.pools.len(), reused), (0, 1, false), "a new pool and its first tile");
+            s.free.push((pool, tile));
+            s.retire_free_pools();
+            assert_eq!(s.retired.len(), 1, "the pool whose tiles all came free is retired");
+            let ((back, _), reused_again) = s.take_tile().expect("a pool tile");
+            assert_eq!(back, pool, "the retired pool's heap is reused");
+            assert!(reused_again, "a retired pool's tiles are not fresh: they are zeroed when mapped");
+            assert_eq!(s.pools.len(), 1, "no second 64 MB heap is created");
+            assert!(s.retired.is_empty(), "the pool left the retired list");
         }
     }
 
