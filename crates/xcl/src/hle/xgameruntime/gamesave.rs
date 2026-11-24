@@ -135,8 +135,28 @@ fn replace_file(tmp: &Path, dest: &Path) -> std::io::Result<()> {
     {
         use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH};
-        let src: Vec<u16> = tmp.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-        let dst: Vec<u16> = dest.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        // MoveFileExW takes a path past MAX_PATH only in its "\\?\" form (std::fs, which wrote the
+        // temp file, adds that itself): a long container name otherwise fails the final move.
+        // Built on the wide path, so a name that is not valid UTF-8 survives unchanged.
+        let verbatim = |p: &Path| -> std::io::Result<Vec<u16>> {
+            let abs = std::path::absolute(p)?;
+            let units: Vec<u16> = abs.as_os_str().encode_wide().collect();
+            const BS: u16 = b'\\' as u16;
+            let mut v = Vec::with_capacity(units.len() + 8);
+            if units.starts_with(&[BS, BS, b'?' as u16, BS]) {
+                v.extend_from_slice(&units);
+            } else if units.starts_with(&[BS, BS]) {
+                v.extend_from_slice(&[BS, BS, b'?' as u16, BS, b'U' as u16, b'N' as u16, b'C' as u16, BS]);
+                v.extend_from_slice(&units[2..]);
+            } else {
+                v.extend_from_slice(&[BS, BS, b'?' as u16, BS]);
+                v.extend_from_slice(&units);
+            }
+            v.push(0);
+            Ok(v)
+        };
+        let src = verbatim(tmp)?;
+        let dst = verbatim(dest)?;
         // SAFETY: `src` and `dst` are valid NUL-terminated UTF-16 paths that outlive the call.
         let ok = unsafe { MoveFileExW(src.as_ptr(), dst.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) };
         if ok != 0 {
@@ -1134,4 +1154,21 @@ mod tests {
         }
     }
 
+    /// A blob whose path is longer than MAX_PATH (a long container name under the data folder)
+    /// is saved: the files are written through Rust's `std::fs`, which takes long paths, and
+    /// the final move took only paths under 260 characters (ERROR_PATH_NOT_FOUND past them).
+    #[test]
+    fn a_blob_past_max_path_is_saved() {
+        let root = std::env::temp_dir().join(format!("xcl-gamesave-long-path-{}", std::process::id()));
+        let dir = root.join("a".repeat(200));
+        let ops = [("data".to_string(), Some(b"v".to_vec()))];
+        let hr = apply(&dir, Some("Long"), &ops);
+        let data = std::fs::read(dir.join("b").join("data")).ok();
+        let display = std::fs::read_to_string(dir.join("display")).ok();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(dir.join("b").join("data").as_os_str().len() > 260);
+        assert_eq!(hr, S_OK);
+        assert_eq!(data.as_deref(), Some(&b"v"[..]));
+        assert_eq!(display.as_deref(), Some("Long"));
+    }
 }
