@@ -4442,6 +4442,104 @@ fn gpu_ds_addtid_roundtrip_and_exec_masking() {
     }
 }
 
+/// `DS_APPEND` / `DS_CONSUME` (LDS form) translate with their counter at `M0[15:0] + offset16`;
+/// `GDS=1` is reported as unsupported.
+#[test]
+fn ds_append_consume_translate_and_reject_gds() {
+    let code = prog(&[
+        ("DS_APPEND", "ENC_DS", &[("VDST", 3), ("OFFSET0", 0x10)], None),
+        ("DS_CONSUME", "ENC_DS", &[("VDST", 4), ("OFFSET0", 0x10)], None),
+    ]);
+    for opt in [Options::default(), Options { wave64: false, hw_wave: 32, ..Options::default() }, runner::options(Mode::Kernel)] {
+        let t = translate(&code, &opt).unwrap();
+        assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
+        assert!(t.hlsl.contains("((m0 & 0xFFFFu) + 16u)"), "{}", t.hlsl);
+    }
+    let gds = prog(&[("DS_APPEND", "ENC_DS", &[("VDST", 3), ("GDS", 1)], None)]);
+    let t = translate(&gds, &Options::default()).unwrap();
+    assert_eq!(t.unsupported.get("ds_append"), Some(&1), "{:?}", t.unsupported);
+    assert!(!t.hlsl.contains("groupshared uint xcl_lds"), "{}", t.hlsl);
+}
+
+/// The counter program of the `DS_APPEND` / `DS_CONSUME` GPU tests: the counter at byte 272
+/// (M0 = 0xABCD_0100: M0[15:0] = 256, offset 16) is seeded with v2 through v1 = 272; then, with
+/// EXEC = s[0:1], append into v3 and consume into v4; with an empty EXEC, append into v7; with
+/// every lane, append into v5 and read the counter into v6.
+fn ds_append_consume_program() -> Vec<u8> {
+    prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 124), ("SSRC0", 255)], Some(0xABCD_0100)),
+        ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 2)], None),
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 0)], None),
+        ("DS_APPEND", "ENC_DS", &[("VDST", 3), ("OFFSET0", 0x10)], None),
+        ("DS_CONSUME", "ENC_DS", &[("VDST", 4), ("OFFSET0", 0x10)], None),
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 128)], None),
+        ("DS_APPEND", "ENC_DS", &[("VDST", 7), ("OFFSET0", 0x10)], None),
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 193)], None),
+        ("DS_APPEND", "ENC_DS", &[("VDST", 5), ("OFFSET0", 0x10)], None),
+        ("DS_READ_B32", "ENC_DS", &[("VDST", 6), ("ADDR", 1)], None),
+    ])
+}
+
+fn ds_append_consume_state(exec_lo: u32, exec_hi: u32) -> KernelState {
+    let mut st = KernelState::default();
+    st.sgpr[0] = exec_lo;
+    st.sgpr[1] = exec_hi;
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let l = l as u32;
+        r[1] = 272;
+        r[2] = 1000;
+        r[3] = 0xCAFE_0000 + l;
+        r[4] = 0xBEEF_0000 + l;
+        r[7] = 0xF00D_0000 + l;
+    }
+    st
+}
+
+/// `DS_APPEND` / `DS_CONSUME` on the GPU, wave64 (split into two wave32 halves on a GPU with
+/// 32-lane waves only): one atomic per wave by its active lane count (lanes in both halves),
+/// the old counter value in every active lane, inactive lanes untouched, an empty EXEC a no-op.
+#[test]
+fn gpu_ds_append_consume_wave64() {
+    if !gpu_ready() {
+        return;
+    }
+    let st = ds_append_consume_state(0x0000_00FF, 0x0000_0003); // lanes 0..7, 32, 33
+    let r = runner::run_code(&ds_append_consume_program(), &st, &[]).unwrap();
+    for l in 0..64 {
+        let lu = l as u32;
+        let active = l < 8 || l == 32 || l == 33;
+        let v = &r.vgpr[l];
+        assert_eq!(v[3], if active { 1000 } else { 0xCAFE_0000 + lu }, "lane {l}: ds_append");
+        assert_eq!(v[4], if active { 1010 } else { 0xBEEF_0000 + lu }, "lane {l}: ds_consume");
+        assert_eq!(v[7], 0xF00D_0000 + lu, "lane {l}: ds_append with an empty EXEC");
+        assert_eq!(v[5], 1000, "lane {l}: ds_append, every lane");
+        assert_eq!(v[6], 1064, "lane {l}: the counter after it");
+    }
+}
+
+/// `DS_APPEND` / `DS_CONSUME` on the GPU, a wave32 program in a 32-lane wave.
+#[test]
+fn gpu_ds_append_consume_wave32() {
+    if !gpu_ready() {
+        return;
+    }
+    let t = translate(&ds_append_consume_program(), &Options { wave64: false, hw_wave: 32, ..Options::default() }).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+    let st = ds_append_consume_state(0x8000_0005, 0); // lanes 0, 2, 31
+    let r = runner::run(&dxil, &st, &[]).unwrap();
+    for l in 0..32 {
+        let lu = l as u32;
+        let active = matches!(l, 0 | 2 | 31);
+        let v = &r.vgpr[l];
+        assert_eq!(v[3], if active { 1000 } else { 0xCAFE_0000 + lu }, "lane {l}: ds_append");
+        assert_eq!(v[4], if active { 1003 } else { 0xBEEF_0000 + lu }, "lane {l}: ds_consume");
+        assert_eq!(v[7], 0xF00D_0000 + lu, "lane {l}: ds_append with an empty EXEC");
+        assert_eq!(v[5], 1000, "lane {l}: ds_append, every lane");
+        assert_eq!(v[6], 1032, "lane {l}: the counter after it");
+    }
+}
+
 /// Ray tracing: image_bvh(64)_intersect_ray on a hand-built BVH (box32 root with 4 children,
 /// a box16 node, triangles), several rays; sorted and unsorted box results, triangle hit as
 /// (t, denominator, i, j) numerators, misses, and the 64-bit node pointer form.

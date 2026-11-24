@@ -4234,6 +4234,50 @@ impl Em {
             }
             return Ok(());
         }
+        // ds_append / ds_consume: the counter at M0[15:0] + offset16 grows / shrinks by the
+        // wave's active lane count in one atomic, and every active lane gets its old value.
+        // Lane 0 of the console wave does the atomic (no change for an empty EXEC); in the
+        // split wave64 form that is the lower half's lane 0, read by both halves after an
+        // exchange.
+        if matches!(name, "ds_append" | "ds_consume") {
+            if f("GDS") != 0 {
+                return Err("GDS");
+            }
+            self.uses_lds = true;
+            let m0 = self.sreg(124);
+            let at = format!("(({m0} & 0xFFFFu) + {off16}u)");
+            let slot = if self.x64() {
+                format!("xcl_lds[min((({at}) >> 2) & 8191u, XCL_X_LDS_TOP)]")
+            } else if self.safe_barrier {
+                format!("xcl_lds[min((({at}) >> 2) & 8191u, XCL_LDS_TOP)]")
+            } else {
+                format!("xcl_lds[(({at}) >> 2) & 8191u]")
+            };
+            let n = if self.opt.wave64 { "countbits(exec_lo) + countbits(exec_hi)" } else { "countbits(exec_lo)" };
+            self.line(&format!("uint {t}_n = {n};"));
+            let delta = if name == "ds_append" {
+                format!("{t}_n")
+            } else {
+                // the negated count goes through a lane read (the same value in every lane
+                // of the console wave): NVIDIA's driver (32.0.16.1742) refuses a pipeline
+                // whose groupshared atomic add takes `0 - x` straight (E_OUTOFMEMORY)
+                let rd = if self.x64() { format!("WaveReadLaneFirst(0u - {t}_n)") } else { format!("rla(0u - {t}_n, 0u)") };
+                self.line(&format!("uint {t}_d = {rd};"));
+                format!("{t}_d")
+            };
+            if self.x64() {
+                // the halves are two hardware waves: the upper half's earlier LDS accesses
+                // (e.g. a store of the counter) are done before the lower half's atomic
+                self.line("xcl_x_meet();");
+            }
+            self.line(&format!("uint {t} = 0u;"));
+            self.line(&format!("if (lane_id == 0u && {t}_n != 0u) InterlockedAdd({slot}, {delta}, {t});"));
+            let rla = self.rla_uniform_fn();
+            self.line(&format!("{t} = {rla}({t}, 0u);"));
+            let dst = Dst::V(f("VDST"));
+            self.write32(&dst, &t);
+            return Ok(());
+        }
         self.uses_lds = true;
         // the address is read before any result is written (ds_read2_b32 v[0:1], v0 …)
         let addr = self.vreg(f("ADDR"));
