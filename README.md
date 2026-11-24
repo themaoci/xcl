@@ -64,6 +64,8 @@ XCL works only on unpacked game files you already own. It does not download, dec
 
 The shader recompiler preserves branches when several loop exits share a destination or a
 branch jumps directly into an else block ([#701](https://github.com/ivall/xcl/issues/701)).
+Far-jump address calculations are resolved to fixed targets only when branches enter at the start of the calculation.
+An entry partway through it keeps the jump indirect and subject to the recompiler's existing indirect-branch limits.
 
 ### Media and tools
 

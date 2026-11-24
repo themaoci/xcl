@@ -532,6 +532,8 @@ fn scalar_int(d: &Decoded, code: u64) -> Option<u32> {
 /// (`far_target`), so it is an unconditional branch like `s_branch` to everything that
 /// follows the control flow. Any other `s_setpc_b64` stays an indirect jump.
 pub fn resolve_far_jumps(insts: &mut [Decoded]) {
+    let mut targets: std::collections::BTreeSet<u64> = insts.iter().filter_map(branch_target).collect();
+    let mut resolved = Vec::new();
     for k in 3..insts.len() {
         let [get, lo, hi, set] = &insts[k - 3..=k] else { continue };
         if get.inst.name != "S_GETPC_B64" || set.inst.name != "S_SETPC_B64" {
@@ -561,7 +563,16 @@ pub fn resolve_far_jumps(insts: &mut [Decoded]) {
         let (Some(l), Some(h)) = (half(lo, r), half(hi, r + 1)) else { continue };
         let offset = (h as u64) << 32 | l as u64;
         let base = get.pc + get.len as u64;
-        insts[k].far_target = Some(if sub { base.wrapping_sub(offset) } else { base.wrapping_add(offset) });
+        let target = if sub { base.wrapping_sub(offset) } else { base.wrapping_add(offset) };
+        targets.insert(target);
+        resolved.push((k, target));
+    }
+    // Every entry must execute GETPC before using its value. Include targets of all
+    // candidate far jumps before checking, so forward edges into later sequences count.
+    for (k, target) in resolved {
+        if !insts[k - 2..=k].iter().any(|d| targets.contains(&d.pc)) {
+            insts[k].far_target = Some(target);
+        }
     }
 }
 
@@ -783,6 +794,64 @@ mod tests {
     fn truncated_and_unknown() {
         assert_eq!(decode(&[0x01, 0x02], 0).err(), Some(DecodeError::Truncated));
         assert_eq!(decode(&[0xff, 0x03, 0x80, 0xbe], 0).err(), Some(DecodeError::Truncated));
+    }
+
+    fn far_jump_sequence(pc: u64, subtract: bool) -> Vec<Decoded> {
+        let names = if subtract { ["S_SUB_U32", "S_SUBB_U32"] } else { ["S_ADD_U32", "S_ADDC_U32"] };
+        let mut out = Vec::new();
+        let mut pc = pc;
+        for (name, enc, fields) in [
+            ("S_GETPC_B64", "ENC_SOP1", vec![("SDST", 0)]),
+            (names[0], "ENC_SOP2", vec![("SDST", 0), ("SSRC0", 0), ("SSRC1", 144)]),
+            (names[1], "ENC_SOP2", vec![("SDST", 1), ("SSRC0", 1), ("SSRC1", 128)]),
+            ("S_SETPC_B64", "ENC_SOP1", vec![("SSRC0", 0)]),
+        ] {
+            let bytes = encode(name, enc, &fields, None).unwrap();
+            let d = decode(&bytes, pc).unwrap();
+            pc += d.len as u64;
+            out.push(d);
+        }
+        out
+    }
+
+    #[test]
+    fn far_jumps_keep_uninterrupted_add_and_subtract_sequences() {
+        for subtract in [false, true] {
+            let mut insts = far_jump_sequence(0x100, subtract);
+            resolve_far_jumps(&mut insts);
+            assert_eq!(branch_target(&insts[3]), Some(if subtract { 0xf4 } else { 0x114 }));
+        }
+    }
+
+    #[test]
+    fn far_jumps_with_an_entry_into_the_sequence_stay_indirect() {
+        for subtract in [false, true] {
+            for entry in 1..=3 {
+                let mut insts = far_jump_sequence(4, subtract);
+                let target = insts[entry].pc;
+                let bytes = encode("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", (target - 4) / 4)], None).unwrap();
+                insts.insert(0, decode(&bytes, 0).unwrap());
+                resolve_far_jumps(&mut insts);
+                assert_eq!(branch_target(insts.last().unwrap()), None,
+                           "entry at {target:#x}, subtract={subtract}");
+            }
+        }
+        // A branch to GETPC executes the whole sequence and still has a fixed target.
+        let bytes = encode("S_BRANCH", "ENC_SOPP", &[("SIMM16", 0)], None).unwrap();
+        let mut insts = vec![decode(&bytes, 0).unwrap()];
+        insts.extend(far_jump_sequence(4, false));
+        resolve_far_jumps(&mut insts);
+        assert_eq!(branch_target(insts.last().unwrap()), Some(24));
+    }
+
+    #[test]
+    fn far_jumps_check_incoming_far_targets_before_resolving() {
+        // The first jump's target is +20, the low add of the second sequence.
+        let mut insts = far_jump_sequence(0, false);
+        insts.extend(far_jump_sequence(16, false));
+        resolve_far_jumps(&mut insts);
+        assert_eq!(branch_target(&insts[3]), Some(20));
+        assert_eq!(branch_target(&insts[7]), None);
     }
 
     /// Normalise an LLVM mnemonic to the AMD spec name (lower case, no encoding suffix).
