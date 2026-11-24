@@ -6179,6 +6179,68 @@ fn far_jumps_are_direct_branches() {
     }
 }
 
+/// A far-jump sequence entered after `s_getpc_b64` by a direct branch or another far jump
+/// depends on the incoming SGPR value and must stay an indirect `s_setpc_b64`.
+#[test]
+fn far_jumps_stay_indirect_when_entered_after_getpc() {
+    let decode_all = |code: &[u8]| {
+        let mut v = Vec::new();
+        let mut off = 0;
+        while off + 4 <= code.len() {
+            let d = crate::gpu::rdna2::decode(&code[off..], off as u64).unwrap();
+            off += d.len;
+            v.push(d);
+        }
+        crate::gpu::rdna2::resolve_far_jumps(&mut v);
+        v
+    };
+
+    // Direct branch at 0x00 into get (0x04), lo (0x08), hi (0x10), or set (0x14).
+    for sub in [false, true] {
+        let (lo, hi) = if sub { ("S_SUB_U32", "S_SUBB_U32") } else { ("S_ADD_U32", "S_ADDC_U32") };
+        let offset = if sub { 4 } else { 0x14 };
+        let expected = if sub { 0x04 } else { 0x1C };
+        for (simm, enters_after_getpc) in [(0u64, false), (1, true), (3, true), (4, true)] {
+            let code = prog(&[
+                ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", simm)], None),
+                ("S_GETPC_B64", "ENC_SOP1", &[("SDST", 4)], None),
+                (lo, "ENC_SOP2", &[("SDST", 4), ("SSRC0", 4), ("SSRC1", 255)], Some(offset)),
+                (hi, "ENC_SOP2", &[("SDST", 5), ("SSRC0", 5), ("SSRC1", 128)], None),
+                ("S_SETPC_B64", "ENC_SOP1", &[("SSRC0", 4)], None),
+                ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 135)], None),
+                ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 137)], None),
+            ]);
+            let insts = decode_all(&code);
+            let want = if enters_after_getpc { None } else { Some(expected) };
+            assert_eq!(insts[4].far_target, want, "sub={sub} simm={simm}");
+            if enters_after_getpc {
+                let t = super::translate(&code, &Options::default()).unwrap();
+                assert!(!t.complete(), "sub={sub} simm={simm} must keep s_setpc_b64 indirect");
+            }
+        }
+    }
+
+    // Far-to-far edge: first far jump (0x00, base 0x04) targets the second sequence's
+    // get (0x14), lo (0x18), hi (0x20), or set (0x24).
+    for (first_off, enters_after_getpc) in [(0x10u32, false), (0x14, true), (0x1C, true), (0x20, true)] {
+        let code = prog(&[
+            ("S_GETPC_B64", "ENC_SOP1", &[("SDST", 4)], None),
+            ("S_ADD_U32", "ENC_SOP2", &[("SDST", 4), ("SSRC0", 4), ("SSRC1", 255)], Some(first_off)),
+            ("S_ADDC_U32", "ENC_SOP2", &[("SDST", 5), ("SSRC0", 5), ("SSRC1", 128)], None),
+            ("S_SETPC_B64", "ENC_SOP1", &[("SSRC0", 4)], None),
+            ("S_GETPC_B64", "ENC_SOP1", &[("SDST", 6)], None),
+            ("S_ADD_U32", "ENC_SOP2", &[("SDST", 6), ("SSRC0", 6), ("SSRC1", 255)], Some(0x10)),
+            ("S_ADDC_U32", "ENC_SOP2", &[("SDST", 7), ("SSRC0", 7), ("SSRC1", 128)], None),
+            ("S_SETPC_B64", "ENC_SOP1", &[("SSRC0", 6)], None),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 137)], None),
+        ]);
+        let insts = decode_all(&code);
+        assert_eq!(insts[3].far_target, Some(0x04 + first_off as u64));
+        let want = if enters_after_getpc { None } else { Some(0x28) };
+        assert_eq!(insts[7].far_target, want, "first_off={first_off:#x}");
+    }
+}
+
 /// Mesh mode for a GPU with 32-lane waves only: the console's two wave64s per group as four
 /// hardware wave32s exchanging masks and lane reads (counter-paired: two console waves),
 /// programs with cross-half operations included; native wave64 and wave32 programs unchanged.
