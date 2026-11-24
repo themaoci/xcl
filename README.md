@@ -93,7 +93,9 @@ KB5029331+), inbox `D3D12Core.dll` stops at SM 6.5; place the Microsoft D3D12 Ag
 next to `xcl.exe`, directly next to `xcl.exe`, in `%LOCALAPPDATA%\XCL\D3D12\`, or point `%XCL_D3D12_DIR%` at it
 (for `cargo test`, use `%LOCALAPPDATA%\XCL\D3D12\` or `%XCL_D3D12_DIR%`). `%XCL_D3D12_DIR%` must name the **folder that
 directly contains `D3D12Core.dll`** — for an unpacked NuGet package that is `bin\x64`, not the package root — and when
-it is set it is the *only* folder searched: a wrong path fails instead of falling through to the defaults.
+it is set it is the *only* folder searched: a wrong path fails instead of falling through to the defaults. Use a
+**stable** Agility SDK release: with Developer Mode off, a `1.7xx-preview` redistributable is refused with
+`D3D12_ERROR_INVALID_REDIST` (0x887e0003), while the stable 1.620.2 loads and exposes Shader Model 6.6 on Windows 10 19044.
 
 - **DXC:** 1.8 or newer is recommended, from the
   [DirectXShaderCompiler releases](https://github.com/microsoft/DirectXShaderCompiler/releases): unpack one
