@@ -111,7 +111,7 @@ pub fn submit(standin: usize, compute: bool, job: Job) {
 
 /// Lazy pipeline creation (`XCL_LAZY_PSO=0`: off): a title's pipelines with console shaders get
 /// their stand-in when made and are built when first used – the first bind of a graphics one
-/// sends it to the workers, a compute one is built at its first bind. A retail game makes
+/// sends it to the workers, a compute one is built ahead (`Preload`) or else at its first bind. A retail game makes
 /// ~51 000 pipelines in its first 30 s and uses few; each one built stays in the driver
 /// (~400 KB), and the process ran out of commit.
 pub fn lazy() -> bool {
@@ -120,7 +120,8 @@ pub fn lazy() -> bool {
 }
 
 /// `submit`, sent to the workers only on its first `resolve` (`lazy`) – or now, at a low
-/// priority, when an earlier run used a pipeline of these shaders (`key`, 0 = none; `used`).
+/// priority, when an earlier run used a pipeline of these shaders (`key`, 0 = none; `used`),
+/// and for every compute pipeline (after those: `Preload`).
 pub fn submit_lazy(standin: usize, compute: bool, job: Job, key: u64) {
     submit_as(standin, compute, job, false, key);
 }
@@ -145,9 +146,15 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
     });
     if send {
         let _ = queue().lock().unwrap().send(p);
-    } else if used::known(key) {
+    } else if used::known(key) || compute {
         if let Some(q) = preload() {
-            q.list.lock().unwrap().push_back(p);
+            let mut g = q.list.lock().unwrap();
+            if used::known(key) {
+                g.0.push_back(p);
+            } else {
+                g.1.push_back(p);
+            }
+            drop(g);
             q.cv.notify_one();
         }
     }
@@ -231,8 +238,16 @@ mod used {
 /// (`XCL_PSO_PRELOAD=0`: off). Apart from the ones a bind sends to (`queue`) and at the lowest
 /// priority: a pipeline that is bound is not held up by the ones made ahead (whoever takes
 /// `job` first builds it), and the title's own threads are not either.
+///
+/// After those, every compute pipeline is built ahead too, as it is made: its first bind waits
+/// for it on the title's thread (a skipped dispatch would corrupt what it computes), and the
+/// driver takes seconds for a big one – on an NVIDIA GPU a retail title's binds waited 3 – 23 s
+/// each, 16 of them within 10 s on five of its threads, and its hang watchdog ended it. Compute
+/// pipelines are few (2 734 of the title's ~58 000), so building them all costs little; graphics
+/// pipelines stay lazy. Each build is kept on disk (`real::driver_cache`) for later runs.
 struct Preload {
-    list: Mutex<std::collections::VecDeque<Arc<Pending>>>,
+    /// (of shaders an earlier run used, the other compute pipelines): the first goes first
+    list: Mutex<(std::collections::VecDeque<Arc<Pending>>, std::collections::VecDeque<Arc<Pending>>)>,
     cv: Condvar,
 }
 
@@ -260,7 +275,7 @@ fn preload() -> Option<&'static Preload> {
                     let p = {
                         let mut g = q.list.lock().unwrap();
                         loop {
-                            if let Some(p) = g.pop_front() {
+                            if let Some(p) = g.0.pop_front().or_else(|| g.1.pop_front()) {
                                 break p;
                             }
                             g = q.cv.wait(g).unwrap();
@@ -343,6 +358,25 @@ mod used_tests {
         assert!(used::noted(unknown_key) && used::noted(known_key), "a first use is kept for the next run");
         released(known);
         released(unknown);
+    }
+
+    /// A compute pipeline is built without a bind even when no earlier run used it: its first
+    /// bind would otherwise build it on the title's thread. A graphics one made with it is not.
+    #[test]
+    fn a_compute_pipeline_is_built_ahead_of_its_first_bind() {
+        let (compute, graphics) = (0x7E57_7003usize, 0x7E57_7004usize);
+        submit_lazy(compute, true, Box::new(|| 0x4323), 0x5EED_0003);
+        submit_lazy(graphics, false, Box::new(|| 0x4324), 0x5EED_0004);
+        let start = std::time::Instant::now();
+        while is_pending(compute) && start.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!is_pending(compute), "built by the workers that build ahead, with no bind");
+        assert_eq!(resolve(compute), 0x4323);
+        assert!(is_pending(graphics), "graphics pipelines stay lazy");
+        assert_eq!(resolve_wait(graphics), 0x4324);
+        released(compute);
+        released(graphics);
     }
 }
 
