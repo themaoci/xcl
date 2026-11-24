@@ -897,6 +897,49 @@ fn gpu_frexp_f64_exp_and_mant() {
     }
 }
 
+/// v_frexp_mant_f32 / _f16 keep the input's sign, as the f64 one does (#580): HLSL frexp()
+/// returns an unsigned mantissa, so −10.125 came out as +0.6328125 and −0 as +0.
+#[test]
+fn gpu_frexp_mant_f32_f16_keep_the_sign() {
+    if !gpu_ready() {
+        return;
+    }
+    let p = prog(&[
+        ("V_FREXP_MANT_F32", "ENC_VOP1", &[("VDST", 2), ("SRC0", V + 0)], None),
+        ("V_FREXP_MANT_F32", "ENC_VOP3", &[("VDST", 3), ("SRC0", V + 0), ("NEG", 1)], None),
+        ("V_FREXP_EXP_I32_F32", "ENC_VOP1", &[("VDST", 4), ("SRC0", V + 0)], None),
+        ("V_FREXP_MANT_F16", "ENC_VOP1", &[("VDST", 5), ("SRC0", V + 1)], None),
+    ]);
+    // (input, mantissa, exponent): mant · 2^exp = input with |mant| in [0.5, 1); 0 / inf / NaN pass through
+    const F32: [(u32, u32, i32); 8] = [
+        (0xC122_0000, 0xBF22_0000, 4),  // −10.125 → −0.6328125 · 2^4
+        (0x4122_0000, 0x3F22_0000, 4),  // 10.125 → 0.6328125 · 2^4
+        (0xBF80_0000, 0xBF00_0000, 1),  // −1 → −0.5 · 2^1
+        (0xBE80_0000, 0xBF00_0000, -1), // −0.25 → −0.5 · 2^−1
+        (0x8000_0000, 0x8000_0000, 0),  // −0 → −0
+        (0x0000_0000, 0x0000_0000, 0),  // +0 → +0
+        (0xFF80_0000, 0xFF80_0000, 0),  // −inf → −inf
+        (0xC2C8_0000, 0xBF48_0000, 7),  // −100 → −0.78125 · 2^7
+    ];
+    // f16: −10.125 → −0.6328125, −1 → −0.5, −0 → −0, 3 → 0.75
+    const F16: [(u32, u32); 4] = [(0xC910, 0xB910), (0xBC00, 0xB800), (0x8000, 0x8000), (0x4200, 0x3A00)];
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[0] = F32[l % F32.len()].0;
+        r[1] = F16[l % F16.len()].0;
+    }
+    let r = runner::run_program(&p, &st, &[]).unwrap().0;
+    for l in 0..64usize {
+        let v = &r.vgpr[l];
+        let (x, mant, exp) = F32[l % F32.len()];
+        assert_eq!(v[2], mant, "lane {l} v_frexp_mant_f32 {:#x}", x);
+        assert_eq!(v[3], mant ^ 0x8000_0000, "lane {l} v_frexp_mant_f32 neg {:#x}", x);
+        assert_eq!(v[4] as i32, exp, "lane {l} v_frexp_exp_i32_f32 {:#x}", x);
+        let (h, hmant) = F16[l % F16.len()];
+        assert_eq!(v[5] & 0xFFFF, hmant, "lane {l} v_frexp_mant_f16 {:#x}", h);
+    }
+}
+
 /// Edge inputs of the f64 operations: |x| ≥ 2^63, values outside the f32 range, denormals,
 /// signed zeros, ±inf and NaN.
 const F64_EDGES: [u64; 22] = [

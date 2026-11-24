@@ -5734,7 +5734,8 @@ uint cvt_norm_i16_f16(uint h) {
 uint cvt_norm_i16_f32(float f) {
     return (uint)(int)round((isnan(f) ? 0.0f : clamp(f, -1.0f, 1.0f)) * 32767.0f) & 0xFFFFu;
 }
-float frexp_mant(float x) { float e; return (isinf(x) || isnan(x)) ? x : frexp(x, e); }
+// HLSL frexp()'s mantissa is unsigned; the ISA's keeps the input's sign (as frexp_mant_d)
+float frexp_mant(float x) { float e; return (isinf(x) || isnan(x)) ? x : asfloat(asuint(frexp(x, e)) | (asuint(x) & 0x80000000u)); }
 int frexp_exp(float x) { float e; frexp(x, e); return (isinf(x) || isnan(x)) ? 0 : (int)e; }
 // Exact f32 x * 2^n on the IEEE-754 bits: handles |n| >= 127, ±0, ±inf, NaN, and subnormals
 // without exp2() overflow/underflow or FTZ flushing.
