@@ -2897,9 +2897,10 @@ impl Em {
         Ok(())
     }
 
-    /// v_swaprel_b32: exchange the fixed VDST with the VGPR at SRC0 + M0. The spec marks
-    /// both read-write, so both old values are captured before either write – an
-    /// overlapping pair (VDST = SRC0 + M0) degenerates to a no-op. Writes honor EXEC.
+    /// v_swaprel_b32: exchange the VGPR at VDST + M0[25:16] with the one at SRC0 + M0[9:0]
+    /// (RDNA 2 ISA, VOP1 opcode 104), the two indices of `v_movrelsd_2_b32`. Both old values
+    /// are captured before either write – an overlapping pair degenerates to a no-op. Writes
+    /// honor EXEC.
     fn swaprel(&mut self, d: &Decoded) -> Result<(), &'static str> {
         if d.variant != Variant::Plain {
             return Err("swaprel SDWA/DPP");
@@ -2915,19 +2916,26 @@ impl Em {
         let m0 = self.sreg(124);
         let act = self.act();
         let (td, ts) = (self.t(), self.t());
-        let vd = self.vreg(vdst);
-        self.line(&format!("uint {td} = {vd};"));
-        let mut cases = String::new();
-        for k in 0..=top.saturating_sub(base) {
-            cases.push_str(&format!(" case {k}u: {ts} = {}; break;", self.vreg(base + k)));
+        let (src_idx, dst_idx) = (format!("({m0} & 0x3FFu)"), format!("(({m0} >> 16) & 0x3FFu)"));
+        // (old value, index, first register) of each side
+        let sides = [(&td, &dst_idx, vdst), (&ts, &src_idx, base)];
+        for (t, idx, first) in sides {
+            let mut cases = String::new();
+            for k in 0..=top.saturating_sub(first) {
+                cases.push_str(&format!(" case {k}u: {t} = {}; break;", self.vreg(first + k)));
+            }
+            self.line(&format!("uint {t} = 0u; switch ({idx}) {{{cases} default: break; }}"));
         }
-        self.line(&format!("uint {ts} = 0u; switch ({m0}) {{{cases} default: break; }}"));
-        let mut cases = String::new();
-        for k in 0..=top.saturating_sub(base) {
-            let v = self.vreg(base + k);
-            cases.push_str(&format!(" case {k}u: {v} = {td}; break;"));
+        // VGPR[dst] = old VGPR[src], then VGPR[src] = old VGPR[dst]
+        let mut body = String::new();
+        for (value, idx, first) in [(&ts, &dst_idx, vdst), (&td, &src_idx, base)] {
+            let mut cases = String::new();
+            for k in 0..=top.saturating_sub(first) {
+                cases.push_str(&format!(" case {k}u: {} = {value}; break;", self.vreg(first + k)));
+            }
+            body.push_str(&format!(" switch ({idx}) {{{cases} default: break; }}"));
         }
-        self.line(&format!("if ({act}) {{ {vd} = {ts}; switch ({m0}) {{{cases} default: break; }} }}"));
+        self.line(&format!("if ({act}) {{{body} }}"));
         Ok(())
     }
 

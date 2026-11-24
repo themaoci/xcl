@@ -321,18 +321,20 @@ fn gpu_scalar_relative_moves() {
     assert_eq!(r.sgpr[33], 101, "split source/destination offsets");
 }
 
-/// v_swaprel_b32: both sides are read-write (fixed VDST + the VGPR at SRC0 + M0); emitted
-/// as the same bounded switch over M0 as v_movrel, both old values captured before writes.
+/// v_swaprel_b32: both sides are read-write (VDST + M0[25:16] and SRC0 + M0[9:0]); emitted
+/// as the same bounded switches as v_movrelsd_2_b32, both old values captured before writes.
 #[test]
 fn v_swaprel_b32_uses_the_m0_relative_switch() {
     let code = prog(&[("V_SWAPREL_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", V + 10)], None)]);
     let t = translate(&code, &Options::default()).unwrap();
     assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
-    // old VDST captured; the M0-relative register read into another temporary
-    assert!(t.hlsl.contains("uint t1 = v5;"), "{}", t.hlsl);
-    assert!(t.hlsl.contains("uint t2 = 0u; switch (m0) { case 0u: t2 = v10; break; default: break; }"), "{}", t.hlsl);
+    // both M0-relative registers read into temporaries, each with its own index
+    let (dst, src) = ("switch (((m0 >> 16) & 0x3FFu)) { case 0u:", "switch ((m0 & 0x3FFu)) { case 0u:");
+    assert!(t.hlsl.contains(&format!("uint t1 = 0u; {dst} t1 = v5; break; case 1u: t1 = v6; break;")), "{}", t.hlsl);
+    assert!(t.hlsl.contains(&format!("uint t2 = 0u; {src} t2 = v10; break; default: break; }}")), "{}", t.hlsl);
     // EXEC-gated exchange of the two captured values
-    assert!(t.hlsl.contains("if (lanebit(exec_lo, exec_hi)) { v5 = t2; switch (m0) { case 0u: v10 = t1; break; default: break; } }"), "{}", t.hlsl);
+    assert!(t.hlsl.contains(&format!("if (lanebit(exec_lo, exec_hi)) {{ {dst} v5 = t2; break;")), "{}", t.hlsl);
+    assert!(t.hlsl.contains(&format!("{src} v10 = t1; break; default: break; }} }}")), "{}", t.hlsl);
     if super::dxc::location().is_ok() {
         super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
     }
@@ -351,8 +353,15 @@ fn gpu_v_swaprel_b32() {
         ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 32)], None), // exec = s[32:33]: all lanes
         ("S_MOV_B32", "ENC_SOP1", &[("SDST", 124), ("SSRC0", 129)], None), // m0 = 1
         ("V_SWAPREL_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", V + 6)], None), // v7 <-> v7: no-op
-        // relative targets lie within the program's VGPRs (as in gpu_v_movrel): v15 used directly
+        // the ISA's two indices: VDST + M0[25:16], SRC0 + M0[9:0]
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 124), ("SSRC0", 255)], Some((2 << 16) | 3)),
+        ("V_SWAPREL_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", V + 10)], None), // v7 <-> v13, v5 untouched
+        // M0 bits outside [25:16] and [9:0] ignored: indices 1 and 2
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 124), ("SSRC0", 255)], Some(0xFC01_FC02)),
+        ("V_SWAPREL_B32", "ENC_VOP1", &[("VDST", 16), ("SRC0", V + 20)], None), // v17 <-> v22
+        // relative targets lie within the program's VGPRs (as in gpu_v_movrel): v15 / v22 used directly
         ("V_MOV_B32", "ENC_VOP1", &[("VDST", 15), ("SRC0", V + 15)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 22), ("SRC0", V + 22)], None),
     ]);
     let mut st = KernelState::default();
     st.sgpr[30] = 0x5555_5555;
@@ -365,14 +374,21 @@ fn gpu_v_swaprel_b32() {
         r[6] = 3000 + l as u32;
         r[14] = 4000 + l as u32;
         r[7] = 700 + l as u32;
+        r[17] = 5000 + l as u32;
+        r[22] = 6000 + l as u32;
+        r[16] = 7000 + l as u32;
+        r[20] = 8000 + l as u32;
     }
     let r = runner::run_program(&p, &st, &[]).unwrap().0;
     for l in 0..64usize {
         let v = &r.vgpr[l];
-        assert_eq!((v[5], v[13]), (2000 + l as u32, 1000 + l as u32), "lane {l} ordinary swap");
-        let expected = if l % 2 == 0 { (4000 + l as u32, 3000 + l as u32) } else { (3000 + l as u32, 4000 + l as u32) };
+        let l32 = l as u32;
+        // v5 <-> v13 (m0 = 3), then v7 (700, after the no-op) <-> v13 (1000) with m0 = (2 << 16) | 3
+        assert_eq!(v[5], 2000 + l32, "lane {l} ordinary swap; v5 untouched by the second");
+        let expected = if l % 2 == 0 { (4000 + l32, 3000 + l32) } else { (3000 + l32, 4000 + l32) };
         assert_eq!((v[6], v[14]), expected, "lane {l} EXEC-gated swap");
-        assert_eq!(v[7], 700 + l as u32, "lane {l} overlapping swap is a no-op");
+        assert_eq!((v[7], v[13]), (1000 + l32, 700 + l32), "lane {l} overlapping no-op, then the destination index");
+        assert_eq!((v[16], v[17], v[20], v[22]), (7000 + l32, 6000 + l32, 8000 + l32, 5000 + l32), "lane {l} M0 bits outside the two fields");
     }
     assert_eq!((r.sgpr[126], r.sgpr[127]), (0xFFFF_FFFF, 0xFFFF_FFFF), "exec restored");
 }
