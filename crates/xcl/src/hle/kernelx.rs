@@ -1846,15 +1846,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fine_timer_makes_short_sleeps_short() {
-        // Windows' Sleep (std::thread::sleep has its own high-resolution timer)
+    fn fine_timer_raises_the_resolution() {
+        // The mechanism, not a scheduler proxy: how long Sleep(1) takes depends on how loaded
+        // the machine is (the rest of the suite runs on other threads), while the resolution
+        // fine_timer asks for is what the title's frame pacing gets.
+        let (mut coarsest, mut finest, mut before) = (0u32, 0u32, 0u32);
+        assert!(unsafe { NtQueryTimerResolution(&mut coarsest, &mut finest, &mut before) } >= 0);
+        assert!(finest > 0, "no timer resolution reported");
         fine_timer();
-        let t = std::time::Instant::now();
-        for _ in 0..20 {
-            unsafe { windows_sys::Win32::System::Threading::Sleep(1) };
-        }
-        let per = t.elapsed() / 20;
-        assert!(per < std::time::Duration::from_millis(5), "Sleep(1) took {per:?}: the 15.6 ms tick");
+        let (mut coarsest, mut finest, mut now) = (0u32, 0u32, 0u32);
+        assert!(unsafe { NtQueryTimerResolution(&mut coarsest, &mut finest, &mut now) } >= 0);
+        assert!(now <= finest, "the timer runs at {now} (100 ns units), the finest is {finest}");
     }
 
     #[test]
