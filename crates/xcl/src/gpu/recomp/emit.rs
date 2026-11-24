@@ -3343,8 +3343,8 @@ impl Em {
             "v_cvt_f32_u32" => fr(format!("(float){a}")),
             "v_cvt_u32_f32" => format!("cvt_u32({})", fs(0)),
             "v_cvt_i32_f32" => format!("(uint)cvt_i32({})", fs(0)),
-            "v_cvt_rpi_i32_f32" => format!("(uint)cvt_i32(floor({} + 0.5f))", fs(0)),
-            "v_cvt_flr_i32_f32" => format!("(uint)cvt_i32(floor({}))", fs(0)),
+            "v_cvt_rpi_i32_f32" => format!("(uint)cvt_rpi({})", fs(0)),
+            "v_cvt_flr_i32_f32" => format!("(uint)cvt_flr({})", fs(0)),
             "v_cvt_f32_ubyte0" => fr(format!("(float)({a} & 0xFFu)")),
             "v_cvt_f32_ubyte1" => fr(format!("(float)(({a} >> 8) & 0xFFu)")),
             "v_cvt_f32_ubyte2" => fr(format!("(float)(({a} >> 16) & 0xFFu)")),
@@ -5834,6 +5834,12 @@ float cos_turns(float x) { float r = abs(x - trunc(x)); float c = select(or(r ==
 float fract_f(float x) { float r = x - floor(x); return select(r >= 1.0f, asfloat(0x3F7FFFFFu), r); }
 uint cvt_u32(float f) { return select(or(isnan(f), f <= 0.0f), 0u, select(f >= 4294967296.0f, 0xFFFFFFFFu, (uint)f)); }
 int cvt_i32(float f) { return select(isnan(f), 0, select(f <= -2147483648.0f, (int)0x80000000u, select(f >= 2147483648.0f, 0x7FFFFFFF, (int)f))); }
+// v_cvt_flr / v_cvt_rpi: unlike v_cvt_i32_f32, a NaN saturates by its sign (measured on RDNA2).
+// rpi is floor(x) + 1 when x - floor(x) >= 0.5, both exact in f32: floor(x + 0.5f) rounds the sum
+// first (0.49999997 would give 1). From 2^23 up every f32 is an integer.
+int nan_by_sign(float x, int v) { uint u = asuint(x); return select((u & 0x7FFFFFFFu) > 0x7F800000u, (int)select((u >> 31) != 0u, 0x80000000u, 0x7FFFFFFFu), v); }
+int cvt_flr(float x) { return nan_by_sign(x, cvt_i32(floor(x))); }
+int cvt_rpi(float x) { float fl = floor(x); bool up = and((asuint(x) & 0x7FFFFFFFu) < 0x4B000000u, x - fl >= 0.5f); return nan_by_sign(x, cvt_i32(fl) + select(up, 1, 0)); }
 int i24(uint v) { return ((int)(v << 8)) >> 8; }
 uint bfe_u(uint v, uint o, uint w) { o &= 31u; w &= 31u; return select(w == 0u, 0u, (v >> o) & (0xFFFFFFFFu >> ((32u - w) & 31u))); }
 int bfe_i(uint v, uint o, uint w) { o &= 31u; w &= 31u; uint s = (32u - w) & 31u; return select(w == 0u, 0, ((int)(((uint)(((int)v) >> o)) << s)) >> s); }

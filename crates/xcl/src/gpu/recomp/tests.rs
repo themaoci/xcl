@@ -1336,6 +1336,60 @@ fn gpu_sin_cos_reduce_in_turns() {
     assert!(bad.is_empty(), "{}", bad.join("\n"));
 }
 
+/// v_cvt_rpi_i32_f32 rounds the exact x + 0.5 down, and v_cvt_rpi / v_cvt_flr saturate a NaN by
+/// its sign, while v_cvt_i32_f32 gives 0 for any NaN. Expected values: measured on RDNA2 silicon
+/// (gfx1036), the same in all four FLOAT_MODE settings,
+/// https://github.com/Marvisak/VIctory/pull/605#issuecomment-7123302580 (negative denormals,
+/// whose flr depends on the denormal mode, are left out).
+#[test]
+fn gpu_cvt_rpi_flr_round_exactly_and_saturate_nan_by_sign() {
+    if !gpu_ready() {
+        return;
+    }
+    // (input, rpi, flr, i32)
+    const ROWS: [(u32, u32, u32, u32); 16] = [
+        (0x3EFF_FFFF, 0x0000_0000, 0x0000_0000, 0x0000_0000),
+        (0x3F00_0000, 0x0000_0001, 0x0000_0000, 0x0000_0000),
+        (0xBF00_0000, 0x0000_0000, 0xFFFF_FFFF, 0x0000_0000),
+        (0xBF00_0001, 0xFFFF_FFFF, 0xFFFF_FFFF, 0x0000_0000),
+        (0x4B00_0001, 0x0080_0001, 0x0080_0001, 0x0080_0001),
+        (0x4B00_0003, 0x0080_0003, 0x0080_0003, 0x0080_0003),
+        (0x4B7F_FFFF, 0x00FF_FFFF, 0x00FF_FFFF, 0x00FF_FFFF),
+        (0xCB00_0001, 0xFF7F_FFFF, 0xFF7F_FFFF, 0xFF7F_FFFF),
+        (0x4F00_0000, 0x7FFF_FFFF, 0x7FFF_FFFF, 0x7FFF_FFFF),
+        (0xCF00_0000, 0x8000_0000, 0x8000_0000, 0x8000_0000),
+        (0x7F80_0000, 0x7FFF_FFFF, 0x7FFF_FFFF, 0x7FFF_FFFF),
+        (0xFF80_0000, 0x8000_0000, 0x8000_0000, 0x8000_0000),
+        (0x7FC0_0000, 0x7FFF_FFFF, 0x7FFF_FFFF, 0x0000_0000),
+        (0xFFC0_0000, 0x8000_0000, 0x8000_0000, 0x0000_0000),
+        (0x7F80_0001, 0x7FFF_FFFF, 0x7FFF_FFFF, 0x0000_0000),
+        (0xFFFF_FFFF, 0x8000_0000, 0x8000_0000, 0x0000_0000),
+    ];
+    let code = prog(&[
+        ("V_CVT_RPI_I32_F32", "ENC_VOP1", &[("VDST", 2), ("SRC0", V + 1)], None),
+        ("V_CVT_FLR_I32_F32", "ENC_VOP1", &[("VDST", 3), ("SRC0", V + 1)], None),
+        ("V_CVT_I32_F32", "ENC_VOP1", &[("VDST", 4), ("SRC0", V + 1)], None),
+    ]);
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[1] = ROWS[l % ROWS.len()].0;
+    }
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    let mut bad = Vec::new();
+    for l in 0..64 {
+        let v = &r.vgpr[l];
+        let (x, rpi, flr, i) = ROWS[l % ROWS.len()];
+        for (name, got, want) in [("v_cvt_rpi_i32_f32", v[2], rpi), ("v_cvt_flr_i32_f32", v[3], flr), ("v_cvt_i32_f32", v[4], i)] {
+            if got != want {
+                bad.push(format!("{name}({x:#010X}) = {got:#010X}, want {want:#010X}"));
+            }
+        }
+    }
+    bad.sort();
+    bad.dedup();
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
 /// Output modifiers each instruction kind applies: omod on f64 (clamp stays in double
 /// precision) and on the f64 → f32 / f32 → f16 conversions, and the integer clamp (saturation) of the
 /// unsigned adds, the packed 16-bit adds and the integer dot products.
