@@ -581,6 +581,7 @@ impl Em {
     /// and multi-warp `s_barrier` usage (for early-exit-safe, bounded `xcl_s_barrier`).
     pub fn configure_round_modes(&mut self, insts: &[Decoded], stop_at_endpgm: bool) {
         let mut writes_nonzero_dp = false;
+        let mut reads_dp = false;
         let mut has_s_barrier = false;
         for d in insts {
             let name = d.inst.name.to_ascii_lowercase();
@@ -617,10 +618,17 @@ impl Em {
                         writes_nonzero_dp = true;
                     }
                 }
+                "s_getreg_b32" => {
+                    let simm = rdna2::field_value(d.enc, &d.words, "SIMM16").unwrap_or(0) as u16;
+                    if hwreg_mode_round_masks(simm).1 != 0 {
+                        reads_dp = true;
+                    }
+                }
                 _ => {}
             }
         }
-        self.dynamic_f16_rm = writes_nonzero_dp && self.has_f16_round_op && !self.has_f64_round_op;
+        // MODE[3:2] is followed at run time where an f16 op rounds by it or the program reads it back
+        self.dynamic_f16_rm = writes_nonzero_dp && (self.has_f16_round_op || reads_dp) && !self.has_f64_round_op;
         self.safe_barrier = has_s_barrier
             && self.compute_or_mesh_hw_waves().is_some_and(|w| w > 1)
             && std::env::var("XCL_SAFE_BARRIER").map_or(true, |v| v.trim() != "0");
@@ -1120,9 +1128,42 @@ impl Em {
         Ok(())
     }
 
+    /// `s_getreg_b32`: SDST = the hardware register's field, shifted down. Only MODE's round
+    /// modes are known here – `[1:0]` (f32) is always 0 (anything else is refused) and `[3:2]`
+    /// is `xcl_fp16_rm` where the program changes it, else 0. The other registers and MODE
+    /// bits (denormals, clamps, HW_ID, cycle counters …) depend on the console's hardware and
+    /// set-up: refused, naming the register.
+    fn getreg(&mut self, d: &Decoded) -> Result<(), &'static str> {
+        let simm = rdna2::field_value(d.enc, &d.words, "SIMM16").unwrap_or(0) as u16;
+        let (id, offset, width) = decode_hwreg(simm);
+        match id {
+            1 => {}
+            2 => return Err("HW_REG_STATUS"),
+            3 => return Err("HW_REG_TRAPSTS"),
+            5 => return Err("HW_REG_GPR_ALLOC"),
+            6 => return Err("HW_REG_LDS_ALLOC"),
+            7 => return Err("HW_REG_IB_STS"),
+            23 => return Err("HW_REG_HW_ID1"),
+            24 => return Err("HW_REG_HW_ID2"),
+            29 => return Err("HW_REG_SHADER_CYCLES"),
+            _ => return Err("hardware register"),
+        }
+        if offset + width > 4 {
+            return Err("HW_REG_MODE bits other than the round modes");
+        }
+        let mode = if self.dynamic_f16_rm { "(xcl_fp16_rm << 2)" } else { "0u" };
+        let mask = (1u32 << width) - 1;
+        let dst = Dst::S(Self::field(d, "SDST"));
+        self.write32(&dst, &format!("(({mode} >> {offset}u) & {mask}u)"));
+        Ok(())
+    }
+
     fn salu(&mut self, d: &Decoded, name: &str) -> Result<(), &'static str> {
         if matches!(name, "s_setreg_imm32_b32" | "s_setreg_b32") {
             return self.setreg(d, name);
+        }
+        if name == "s_getreg_b32" {
+            return self.getreg(d);
         }
         if matches!(name, "s_movrels_b32" | "s_movrels_b64" | "s_movreld_b32" | "s_movreld_b64" | "s_movrelsd_2_b32") {
             return self.smovrel(d, name);

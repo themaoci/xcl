@@ -7239,6 +7239,62 @@ fn round_mode_classification_and_lowering() {
     assert!(t.complete(), "{:?}", t.unsupported_why);
 }
 
+/// `s_getreg_b32` reads MODE's round modes (`[1:0]` always 0, `[3:2]` followed through
+/// `xcl_fp16_rm` once the program reads them, with or without f16 ops) and refuses the
+/// registers and MODE bits XCL does not model, naming them.
+#[test]
+fn s_getreg_b32_reads_the_round_modes_and_refuses_the_rest() {
+    let getreg = |id, offset, width, sdst| ("S_GETREG_B32", "ENC_SOPK", vec![("SIMM16", hwreg_imm(id, offset, width)), ("SDST", sdst)], None::<u32>);
+    let build = |list: Vec<(&'static str, &'static str, Vec<(&'static str, u64)>, Option<u32>)>| {
+        let v: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(n, e, f, l)| (*n, *e, f.as_slice(), *l)).collect();
+        translate(&prog(&v), &Options::default()).unwrap()
+    };
+    // MODE never changed: a constant 0
+    let t = build(vec![getreg(1, 0, 4, 2)]);
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    assert!(t.hlsl.contains("((0u >> 0u) & 15u)") && !t.hlsl.contains("xcl_fp16_rm"), "{}", t.hlsl);
+    // changed and read back without f16 ops: followed at run time
+    let t = build(vec![("S_ROUND_MODE", "ENC_SOPP", vec![("SIMM16", 0xC)], None), getreg(1, 2, 2, 3)]);
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    assert!(t.hlsl.contains("xcl_fp16_rm = 3u;") && t.hlsl.contains("(((xcl_fp16_rm << 2) >> 2u) & 3u)"), "{}", t.hlsl);
+    // refused, naming what was read
+    for (id, offset, width, why) in [
+        (23, 0, 32, "s_getreg_b32: HW_REG_HW_ID1"),
+        (29, 0, 20, "s_getreg_b32: HW_REG_SHADER_CYCLES"),
+        (2, 0, 1, "s_getreg_b32: HW_REG_STATUS"),
+        (1, 0, 8, "s_getreg_b32: HW_REG_MODE bits other than the round modes"),
+        (1, 4, 4, "s_getreg_b32: HW_REG_MODE bits other than the round modes"),
+    ] {
+        let t = build(vec![getreg(id, offset, width, 2)]);
+        assert!(!t.complete());
+        assert!(t.unsupported_why.contains_key(why), "{id}/{offset}/{width}: {:?}", t.unsupported_why);
+    }
+}
+
+/// `s_getreg_b32` of MODE on the GPU, before and after `s_round_mode` / `s_setreg_imm32_b32`
+/// change the f16 / f64 round mode, in a program with no f16 op.
+#[test]
+fn gpu_s_getreg_b32_round_modes() {
+    if !gpu_ready() {
+        return;
+    }
+    let code = prog(&[
+        ("S_GETREG_B32", "ENC_SOPK", &[("SIMM16", hwreg_imm(1, 0, 4)), ("SDST", 2)], None),
+        ("S_ROUND_MODE", "ENC_SOPP", &[("SIMM16", 0xC)], None),
+        ("S_GETREG_B32", "ENC_SOPK", &[("SIMM16", hwreg_imm(1, 0, 4)), ("SDST", 3)], None),
+        ("S_GETREG_B32", "ENC_SOPK", &[("SIMM16", hwreg_imm(1, 3, 1)), ("SDST", 4)], None),
+        ("S_SETREG_IMM32_B32", "ENC_SOPK", &[("SIMM16", hwreg_imm(1, 2, 2))], Some(1)),
+        ("S_GETREG_B32", "ENC_SOPK", &[("SIMM16", hwreg_imm(1, 2, 2)), ("SDST", 5)], None),
+        ("S_GETREG_B32", "ENC_SOPK", &[("SIMM16", hwreg_imm(1, 1, 3)), ("SDST", 6)], None),
+    ]);
+    let mut st = KernelState::default();
+    for s in 2..=6 {
+        st.sgpr[s] = 0xDEAD_BEEF;
+    }
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    assert_eq!(&r.sgpr[2..=6], &[0, 0xC, 1, 1, 2], "MODE[3:0] = 0, then 0xC, then 0x4");
+}
+
 #[test]
 fn gpu_nonfused_mad_and_mac_prevent_fma_contraction() {
     if !gpu_ready() {
