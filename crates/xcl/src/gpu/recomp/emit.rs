@@ -3025,7 +3025,7 @@ impl Em {
             "v_fmac_f16" => fr(format!("mad({}, {}, f16tof32({curh}))", fh(0), fh(1))),
             "v_fmamk_f16" => fr(format!("mad({}, f16tof32({} & 0xFFFFu), {})", fh(0), u[1], fh(2))),
             "v_fmaak_f16" => fr(format!("mad({}, {}, f16tof32({} & 0xFFFFu))", fh(0), fh(1), u[2])),
-            "v_ldexp_f16" => fr(format!("ldexp({}, (float){})", fh(0), si(1))),
+            "v_ldexp_f16" => fr(format!("ldexp_f({}, {})", fh(0), si(1))),
             "v_rcp_f16" => fr(format!("rcp({})", fh(0))),
             "v_rsq_f16" => fr(format!("rsqrt({})", fh(0))),
             "v_sqrt_f16" => fr(format!("sqrt({})", fh(0))),

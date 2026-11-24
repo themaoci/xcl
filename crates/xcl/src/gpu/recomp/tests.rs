@@ -2684,6 +2684,39 @@ fn gpu_images_a16_d16() {
     }
 }
 
+/// v_ldexp_f16 at the edges: ±0 and ±inf keep their value for any exponent (no 0·inf NaN from a
+/// 2^n that overflows f32), NaN stays NaN, underflow lands on 0 and exact scalings stay exact
+/// (#658). Overflow of a finite value is left out: it depends on the f16 rounding mode (#111).
+#[test]
+fn gpu_ldexp_f16_zero_inf_and_large_exponents() {
+    for wave64 in gpu_waves() {
+        let p = prog(&[("V_LDEXP_F16", "ENC_VOP2", &[("VDST", 10), ("SRC0", V), ("VSRC1", 1)], None)]);
+        let (dxil, mem) = kernel_wave(&p, wave64);
+        // (x, n, want)
+        let cases: [(u16, i16, u16); 11] = [
+            (0x0000, 200, 0x0000), (0x8000, 300, 0x8000), (0x0000, 32767, 0x0000), (0x8000, -32768, 0x8000),
+            (0x7C00, -200, 0x7C00), (0xFC00, -300, 0xFC00), (0x7C00, -32768, 0x7C00), (0x7E00, 5, 0x7E00),
+            (0x3C00, -30, 0x0000), (0x0001, 10, 0x0400), (0x3C00, 3, 0x4800),
+        ];
+        let mut st = KernelState::default();
+        for (l, r) in st.vgpr.iter_mut().enumerate() {
+            let (x, n, _) = cases[l % cases.len()];
+            (r[0], r[1], r[10]) = (x as u32, n as u16 as u32, 0);
+        }
+        let r = runner::run(&dxil, &st, &mem).unwrap();
+        let mut bad = Vec::new();
+        for (l, (x, n, want)) in cases.iter().enumerate() {
+            let got = (r.vgpr[l][10] & 0xFFFF) as u16;
+            // any NaN encoding counts as NaN
+            let ok = got == *want || (*want & 0x7C00 == 0x7C00 && *want & 0x3FF != 0 && got & 0x7C00 == 0x7C00 && got & 0x3FF != 0);
+            if !ok {
+                bad.push(format!("ldexp_f16({x:#06x}, {n}) = {got:#06x}, want {want:#06x}"));
+            }
+        }
+        assert!(bad.is_empty(), "wave{}: {} of {} wrong\n{}", if wave64 { 64 } else { 32 }, bad.len(), cases.len(), bad.join("\n"));
+    }
+}
+
 /// f32 → IEEE half bits (exact for the small values used in tests).
 fn half_bits(x: f32) -> u32 {
     if x == 0.0 {
