@@ -13,6 +13,7 @@ use crate::util::glob_match;
 pub mod acphal;
 pub mod d3d12_layout;
 pub mod d3d12x;
+pub mod dbghelp;
 pub mod dstorage;
 pub mod dxcompiler;
 pub mod gameinput;
@@ -108,6 +109,7 @@ fn build(config: &Config) -> Registry {
         HleModule::new(XG, xg::exports(), &[]),
         HleModule::new(ACPHAL, acphal::exports(), &[]),
         HleModule::new(GAMEINPUT, gameinput::exports(), &[]),
+        HleModule::new(dbghelp::DBGHELP, dbghelp::exports(), &["dbghelp.dll"]),
     ];
     let offline = netoff::enabled();
     if offline {
@@ -186,6 +188,9 @@ fn build(config: &Config) -> Registry {
     for p in ["dxcompiler_xs.dll", "dxcompiler_x.dll"] {
         routes.push((p.into(), Route::Hle(c)));
     }
+    // a title's minidump of itself (its crash handler): `dbghelp`
+    let dh = idx(dbghelp::DBGHELP);
+    routes.push((dbghelp::DBGHELP.into(), Route::Hle(dh)));
     if offline {
         let n = idx(netoff::NETOFF);
         for p in ["winhttp.dll", "ws2_32.dll"] {
