@@ -3716,7 +3716,7 @@ impl Em {
                         self.line(&format!("uint {t} = {read};"));
                         self.line(&format!("{t} = select(and(xcl_hw32, ({b} & 63u) >= 32u), {c:#010x}u, {t});"));
                     }
-                    (Some(Read::Shadow), Some((v, l))) if l < 32 => self.line(&format!("uint {t} = xcl_sh{v}_{l};")),
+                    (Some(Read::Shadow), Some((v, l))) if self.x64() || l < 32 => self.line(&format!("uint {t} = xcl_sh{v}_{l};")),
                     (Some(Read::Shadow), Some((v, l))) => self.line(&format!("uint {t} = xcl_sh{v}_{l}; if (!xcl_hw32) {t} = {read};")),
                     _ => self.line(&format!("uint {t} = {read};")),
                 }
@@ -4464,8 +4464,10 @@ impl Em {
             self.x64_prelude(&mut h);
         }
         if let Some(u) = &self.upper {
-            // wave64 VS / PS on a GPU with 32-lane waves only (`upper_lanes`)
-            h.push_str("// the wave has 32 lanes: it is a console wave whose lanes 32..63 are not populated\nstatic bool xcl_hw32 = false;\n");
+            if !self.x64() {
+                // wave64 VS / PS on a GPU with 32-lane waves only (`upper_lanes`)
+                h.push_str("// the wave has 32 lanes: it is a console wave whose lanes 32..63 are not populated\nstatic bool xcl_hw32 = false;\n");
+            }
             for (v, l) in &u.shadows {
                 let _ = writeln!(h, "static uint xcl_sh{v}_{l} = 0u; // v_writelane slot: v{v} lane {l}");
             }

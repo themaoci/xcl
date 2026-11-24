@@ -6493,6 +6493,46 @@ fn gpu_split_wave64_lane_local_masks() {
     }
 }
 
+/// SGPR spill slots (`v_writelane_b32` → `v_readlane_b32` with a constant lane in either half)
+/// read their scalar shadow in split-wave64 mode without exchanging across the two halves, while
+/// a lane read after a vector write still exchanges and reads the written lane.
+#[test]
+fn gpu_split_wave64_writelane_spill_shadows() {
+    if !gpu_ready() {
+        return;
+    }
+    let code = prog(&[
+        // spill s0 -> v10[5] (lower half) and s1 -> v10[42] (upper half)
+        ("V_WRITELANE_B32", "ENC_VOP3", &[("VDST", 10), ("SRC0", 0), ("SRC1", 128 + 5)], None),
+        ("V_WRITELANE_B32", "ENC_VOP3", &[("VDST", 10), ("SRC0", 1), ("SRC1", 128 + 42)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 2), ("SRC0", V + 10), ("SRC1", 128 + 5)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 3), ("SRC0", V + 10), ("SRC1", 128 + 42)], None),
+        // overwrite v11 as a vector: lane 42 must still exchange across halves
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 11), ("SRC0", 128 + 10), ("VSRC1", 0)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 4), ("SRC0", V + 11), ("SRC1", 128 + 42)], None),
+    ]);
+    if runner::split_wave64() {
+        let t = translate(&code, &runner::options(Mode::Kernel)).unwrap();
+        assert!(t.hlsl.contains("xcl_sh10_5") && t.hlsl.contains("xcl_sh10_42"), "shadow scalars declared");
+        assert!(!t.hlsl.contains("xcl_hw32"), "split-wave64 does not emit VS/PS xcl_hw32");
+        assert_eq!(t.hlsl.matches("= xcl_x_rla_uniform(").count(), 1, "only the non-spill read exchanges");
+    }
+    let mut st = KernelState::default();
+    st.sgpr[0] = 0x1122_3344;
+    st.sgpr[1] = 0x5566_7788;
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[0] = 100 + l as u32;
+        r[10] = 0xDEAD_0000 + l as u32;
+    }
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    assert_eq!(r.sgpr[2], 0x1122_3344, "lower-half spill reload");
+    assert_eq!(r.sgpr[3], 0x5566_7788, "upper-half spill reload");
+    assert_eq!(r.sgpr[4], 152, "non-spill upper-half lane read still exchanges");
+    assert_eq!(r.vgpr[5][10], 0x1122_3344, "v_writelane still updates VGPR lane 5");
+    assert_eq!(r.vgpr[42][10], 0x5566_7788, "v_writelane still updates VGPR lane 42");
+    assert_eq!(r.vgpr[6][10], 0xDEAD_0006, "other lanes of v10 untouched");
+}
+
 /// Masks that are read whole after a write `x64_masks` must not take for an overwrite (an
 /// SDWA compare into its SDST, `s_bitset1`, `s_movreld`) or through a read the operand
 /// tables do not show (`s_movrels`, an SMEM register offset, an SDWA scalar src1): each is

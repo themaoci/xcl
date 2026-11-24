@@ -811,6 +811,92 @@ pub fn analyze(insts: &[Decoded]) -> UpperLanes {
     out
 }
 
+/// Forward data-flow for split-wave64 (`x64`) programs: every `v_readlane_b32` with a constant
+/// lane whose slot was written by `v_writelane_b32` on every path reaching it (with no
+/// intervening write to that VGPR) can read a scalar shadow instead of exchanging across the two
+/// wave32 halves. Both halves hold identical SGPRs (`x64_masks` keeps `v_writelane_b32`'s scalar
+/// source whole-live).
+pub fn analyze_spills(insts: &[Decoded]) -> UpperLanes {
+    let mut out = UpperLanes::default();
+    if insts.is_empty() || !insts.iter().any(|d| d.inst.name == "V_WRITELANE_B32") {
+        return out;
+    }
+    let pcs: BTreeMap<u64, usize> = insts.iter().enumerate().map(|(i, d)| (d.pc, i)).collect();
+    let succ = successors(insts, &pcs);
+    let loops = super::loop_ranges(insts);
+    let mut at: Vec<Option<BTreeMap<u64, u64>>> = vec![None; insts.len()];
+    at[0] = Some(BTreeMap::new());
+    let mut work = BTreeSet::from([0usize]);
+    let join = |a: &BTreeMap<u64, u64>, b: &BTreeMap<u64, u64>| -> BTreeMap<u64, u64> {
+        a.iter()
+            .filter_map(|(v, m)| {
+                let m = m & b.get(v).copied().unwrap_or(0);
+                (m != 0).then_some((*v, m))
+            })
+            .collect()
+    };
+    let propagate = |at: &mut [Option<BTreeMap<u64, u64>>], work: &mut BTreeSet<usize>, j: usize, st: &BTreeMap<u64, u64>| {
+        let new = match &at[j] {
+            None => st.clone(),
+            Some(old) => join(old, st),
+        };
+        if at[j].as_ref() != Some(&new) {
+            at[j] = Some(new);
+            work.insert(j);
+        }
+    };
+    while let Some(i) = work.pop_first() {
+        let before = at[i].clone().expect("queued with a state");
+        let mut st = before.clone();
+        let d = &insts[i];
+        let name = d.inst.name;
+        if name == "V_WRITELANE_B32" {
+            let v = rdna2::field_value(d.enc, &d.words, "VDST").unwrap_or(0);
+            match lane_operand(d) {
+                Lane::Const(l) => *st.entry(v).or_default() |= 1u64 << l,
+                Lane::Sgpr => {
+                    st.remove(&v);
+                }
+            }
+        } else if name.starts_with("V_MOVREL") || name.starts_with("V_SWAPREL") {
+            st.clear();
+        } else {
+            for v in vgpr_writes(d) {
+                st.remove(&v);
+            }
+        }
+        let Some(s) = &succ[i] else {
+            return UpperLanes::default();
+        };
+        for &j in s {
+            propagate(&mut at, &mut work, j, &st);
+        }
+        // `LOOP_GUARD` can exit a loop early before or after any instruction in its range.
+        for &(a, b) in &loops {
+            if a <= d.pc && d.pc < b {
+                if let Some((_, &exit_j)) = pcs.range(b..).next() {
+                    propagate(&mut at, &mut work, exit_j, &before);
+                    propagate(&mut at, &mut work, exit_j, &st);
+                }
+            }
+        }
+    }
+    for (d, st) in insts.iter().zip(&at) {
+        let Some(st) = st else {
+            continue;
+        };
+        if d.inst.name == "V_READLANE_B32" {
+            if let Some((v, l)) = slot(d) {
+                if (st.get(&v).copied().unwrap_or(0) >> l) & 1 == 1 {
+                    out.shadows.insert((v, l));
+                    out.reads.insert(d.pc, Read::Shadow);
+                }
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -974,5 +1060,62 @@ mod tests {
         // both paths the same constant (or nothing): the constant
         let r = reads(&[("S_CBRANCH_SCC0", "ENC_SOPP", &[("SIMM16", 4)], None), WWM, MASK, SEED, RESTORE, READ32]);
         assert_eq!(r, vec![Read::Const(u32::MAX)]);
+    }
+
+    #[test]
+    fn spills_follow_writelane_for_both_halves() {
+        let p = program(&[
+            ("V_WRITELANE_B32", "ENC_VOP3", &[("VDST", 10), ("SRC0", 20), ("SRC1", 128 + 5)], None),
+            ("V_WRITELANE_B32", "ENC_VOP3", &[("VDST", 10), ("SRC0", 21), ("SRC1", 128 + 37)], None),
+            ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 22), ("SRC0", V + 10), ("SRC1", 128 + 5)], None),
+            ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 23), ("SRC0", V + 10), ("SRC1", 128 + 37)], None),
+        ]);
+        let a = analyze_spills(&p);
+        assert_eq!(a.reads.get(&p[2].pc), Some(&Read::Shadow));
+        assert_eq!(a.reads.get(&p[3].pc), Some(&Read::Shadow));
+        assert!(a.shadows.contains(&(10, 5)) && a.shadows.contains(&(10, 37)));
+    }
+
+    #[test]
+    fn spills_stay_conservative_across_overwrites_branches_and_loops() {
+        // VALU write to the VGPR invalidates its spill slots
+        let p = program(&[
+            ("V_WRITELANE_B32", "ENC_VOP3", &[("VDST", 10), ("SRC0", 20), ("SRC1", 128 + 5)], None),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 10), ("SRC0", 128 + 1)], None),
+            ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 22), ("SRC0", V + 10), ("SRC1", 128 + 5)], None),
+        ]);
+        assert!(analyze_spills(&p).shadows.is_empty());
+
+        // dynamic-lane writelane invalidates the VGPR's slots
+        let p = program(&[
+            ("V_WRITELANE_B32", "ENC_VOP3", &[("VDST", 10), ("SRC0", 20), ("SRC1", 128 + 5)], None),
+            ("V_WRITELANE_B32", "ENC_VOP3", &[("VDST", 10), ("SRC0", 21), ("SRC1", 2)], None),
+            ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 22), ("SRC0", V + 10), ("SRC1", 128 + 5)], None),
+        ]);
+        assert!(analyze_spills(&p).shadows.is_empty());
+
+        // only one branch writes the spill slot
+        let p = program(&[
+            ("S_CBRANCH_SCC0", "ENC_SOPP", &[("SIMM16", 2)], None),
+            ("V_WRITELANE_B32", "ENC_VOP3", &[("VDST", 10), ("SRC0", 20), ("SRC1", 128 + 5)], None),
+            ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 22), ("SRC0", V + 10), ("SRC1", 128 + 5)], None),
+        ]);
+        assert!(analyze_spills(&p).shadows.is_empty());
+
+        // write inside a loop cannot be trusted after the loop (LOOP_GUARD may exit before it)
+        let p = program(&[
+            ("V_WRITELANE_B32", "ENC_VOP3", &[("VDST", 10), ("SRC0", 20), ("SRC1", 128 + 5)], None),
+            ("S_CBRANCH_SCC0", "ENC_SOPP", &[("SIMM16", (-3i16) as u16 as u64)], None),
+            ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 22), ("SRC0", V + 10), ("SRC1", 128 + 5)], None),
+        ]);
+        assert!(analyze_spills(&p).shadows.is_empty());
+
+        // indirect jump bails out
+        let p = program(&[
+            ("V_WRITELANE_B32", "ENC_VOP3", &[("VDST", 10), ("SRC0", 20), ("SRC1", 128 + 5)], None),
+            ("S_SETPC_B64", "ENC_SOP1", &[("SSRC0", 2)], None),
+            ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 22), ("SRC0", V + 10), ("SRC1", 128 + 5)], None),
+        ]);
+        assert!(analyze_spills(&p).shadows.is_empty());
     }
 }
