@@ -1232,6 +1232,100 @@ fn gpu_abs_neg_on_move_select_and_conversions() {
     }
 }
 
+/// v_sin / v_cos take turns and reduce them exactly: every functional example the RDNA 2 ISA
+/// prints for V_SIN_F32 / V_COS_F32 (p.142) and V_SIN_F16 / V_COS_F16 (p.149), exact zeros at
+/// whole, half and quarter turns, and large arguments that keep their phase (2π·(x - trunc(x))).
+#[test]
+fn gpu_sin_cos_reduce_in_turns() {
+    if !gpu_ready() {
+        return;
+    }
+    #[derive(Clone, Copy, Debug)]
+    enum E {
+        Bits(u32),
+        Nan,
+        Near(f64),
+    }
+    use E::*;
+    let turn = |x: f64, f: fn(f64) -> f64| f(2.0 * std::f64::consts::PI * (x - x.trunc()));
+    let near = |x: f32| (Near(turn(x as f64, f64::sin)), Near(turn(x as f64, f64::cos)));
+    // (input, sin, cos)
+    let mut c32: Vec<(u32, E, E)> = vec![
+        // the ISA's examples
+        (0xFF80_0000, Nan, Nan),
+        (0xFF7F_FFFF, Bits(0), Bits(0x3F80_0000)),
+        (0x8000_0000, Bits(0x8000_0000), Bits(0x3F80_0000)),
+        (0x3E80_0000, Bits(0x3F80_0000), Bits(0)),
+        (0x7F80_0000, Nan, Nan),
+        (0x7FC0_1234, Nan, Nan), // a NaN stays NaN
+        // +MaxFloat, and exact zeros at half and quarter turns
+        (0x7F7F_FFFF, Bits(0), Bits(0x3F80_0000)),
+        (f(0.5), Bits(0), Near(-1.0)),
+        (f(-0.75), Near(1.0), Bits(0)),
+        (f(12345.5), Bits(0), Near(-1.0)),
+        (f(7.25), Near(1.0), Bits(0)),
+        (f(8388607.5), Bits(0), Near(-1.0)),
+    ];
+    for x in [0.1f32, -3.3, 255.125, 100000.125, 1000000.125, -2097151.875] {
+        let (s, c) = near(x);
+        c32.push((f(x), s, c));
+    }
+    let f16v = |h: u32| -> f64 {
+        let (s, e, m) = (if h & 0x8000 != 0 { -1.0 } else { 1.0 }, (h >> 10) & 0x1F, (h & 0x3FF) as f64);
+        s * if e == 0 { m * 2f64.powi(-24) } else { (1.0 + m / 1024.0) * 2f64.powi(e as i32 - 15) }
+    };
+    let c16: Vec<(u32, E, E)> = vec![
+        (0xFC00, Nan, Nan),
+        (0xFBFF, Bits(0), Bits(0x3C00)),
+        (0x8000, Bits(0x8000), Bits(0x3C00)),
+        (0x3400, Bits(0x3C00), Bits(0)),
+        (0x7BFF, Bits(0), Bits(0x3C00)),
+        (0x7C00, Nan, Nan),
+        (0x7E01, Nan, Nan),
+        (0x5BF8, Bits(0), Bits(0x3C00)),                               // 255 turns
+        (0x3800, Bits(0), Near(-1.0)),                                 // half a turn
+        (0x5BF9, Near(turn(255.125, f64::sin)), Near(turn(255.125, f64::cos))),
+        (0xD640, Near(turn(-100.0, f64::sin)), Near(turn(-100.0, f64::cos))), // -100
+    ];
+    let p = prog(&[
+        ("V_SIN_F32", "ENC_VOP1", &[("VDST", 2), ("SRC0", V + 1)], None),
+        ("V_COS_F32", "ENC_VOP1", &[("VDST", 3), ("SRC0", V + 1)], None),
+        ("V_SIN_F16", "ENC_VOP1", &[("VDST", 4), ("SRC0", V + 6)], None),
+        ("V_COS_F16", "ENC_VOP1", &[("VDST", 5), ("SRC0", V + 6)], None),
+    ]);
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[1] = c32[l % c32.len()].0;
+        r[6] = c16[l % c16.len()].0;
+    }
+    let r = runner::run_code(&p, &st, &[]).unwrap();
+    let mut bad = Vec::new();
+    let mut check = |name: &str, x: u32, got: u32, want: E, is_nan: bool, value: f64, tol: f64| {
+        let ok = match want {
+            Bits(b) => got == b,
+            Nan => is_nan,
+            Near(v) => (value - v).abs() <= tol,
+        };
+        if !ok {
+            bad.push(format!("{name}({x:#X}) = {got:#X} ({value}), want {want:?}"));
+        }
+    };
+    for l in 0..64 {
+        let v = &r.vgpr[l];
+        let (x, s, c) = c32[l % c32.len()];
+        for (name, got, want) in [("v_sin_f32", v[2], s), ("v_cos_f32", v[3], c)] {
+            check(name, x, got, want, f32::from_bits(got).is_nan(), f32::from_bits(got) as f64, 2f64.powi(-16));
+        }
+        let (x, s, c) = c16[l % c16.len()];
+        for (name, got, want) in [("v_sin_f16", v[4] & 0xFFFF, s), ("v_cos_f16", v[5] & 0xFFFF, c)] {
+            check(name, x, got, want, got & 0x7C00 == 0x7C00 && got & 0x3FF != 0, f16v(got), 2f64.powi(-10));
+        }
+    }
+    bad.sort();
+    bad.dedup();
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
 /// Output modifiers each instruction kind applies: omod on f64 (clamp stays in double
 /// precision) and on the f64 → f32 / f32 → f16 conversions, and the integer clamp (saturation) of the
 /// unsigned adds, the packed 16-bit adds and the integer dot products.
