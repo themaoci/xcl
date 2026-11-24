@@ -370,6 +370,45 @@ fn scalar_signed_leading_bit_scans() {
 }
 
 #[test]
+fn scalar_quadmask_and_bitreplicate() {
+    let code = prog(&[
+        ("S_QUADMASK_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 4)], None),
+        ("S_QUADMASK_B64", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 4)], None),
+        ("S_BITREPLICATE_B64_B32", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 6)], None),
+    ]);
+    let t = translate(&code, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
+    assert!(t.hlsl.contains("quadmask(s4)") && t.hlsl.contains("quadmask(s4) | (quadmask(s5) << 8)"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("bitrep16(s6 & 0xFFFFu)") && t.hlsl.contains("bitrep16(s6 >> 16)"), "{}", t.hlsl);
+    if super::dxc::location().is_ok() {
+        super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+    }
+}
+
+#[test]
+fn gpu_scalar_quadmask_and_bitreplicate() {
+    if !gpu_ready() {
+        return;
+    }
+    let code = prog(&[
+        ("S_QUADMASK_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 4)], None),
+        ("S_QUADMASK_B64", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 4)], None),
+        ("S_BITREPLICATE_B64_B32", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 6)], None),
+        ("S_QUADMASK_B32", "ENC_SOP1", &[("SDST", 1), ("SSRC0", 7)], None),
+    ]);
+    let mut st = KernelState::default();
+    st.sgpr[4..8].copy_from_slice(&[0x80F0_0301, 0x0000_1000, 0x8001_0005, 0]);
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    // one bit per nibble that has any bit set
+    assert_eq!(r.sgpr[0], 0xA5, "quadmask_b32");
+    assert_eq!((r.sgpr[2], r.sgpr[3]), (0x08A5, 0), "quadmask_b64");
+    // each source bit doubled: 0x0005 -> 0x33, 0x8001 -> 0xC0000003
+    assert_eq!((r.sgpr[8], r.sgpr[9]), (0x33, 0xC000_0003), "bitreplicate");
+    // the last quadmask saw zero, so SCC is clear
+    assert_eq!((r.sgpr[1], r.scc), (0, 0), "quadmask of zero clears SCC");
+}
+
+#[test]
 fn scalar_relative_move_cluster() {
     let code = prog(&[
         ("S_MOVRELS_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 10)], None),
