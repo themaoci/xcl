@@ -5680,7 +5680,8 @@ uint f32_to_f16_rm(float f, uint rm) {
     return sign | (h + (uint)inc);
 }
 float mad_nf_f16(float a, float b, float c, uint rm) { precise float p = a * b; float p16 = f16tof32(f32_to_f16_rm(p, rm)); precise float r = p16 + c; return r; }
-float med3f(float a, float b, float c) { return max(min(a, b), min(max(a, b), c)); }
+// with a NaN operand the hardware gives v_min(v_min(a, b), c): the smaller of the other two
+float med3f(float a, float b, float c) { return (isnan(a) || isnan(b) || isnan(c)) ? min(min(a, b), c) : max(min(a, b), min(max(a, b), c)); }
 uint med3u(uint a, uint b, uint c) { return max(min(a, b), min(max(a, b), c)); }
 int med3i(int a, int b, int c) { return max(min(a, b), min(max(a, b), c)); }
 // x - floor(x) below 1.0 (RDNA: a NaN stays NaN and ±inf gives NaN – min() would return the

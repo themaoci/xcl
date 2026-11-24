@@ -2717,6 +2717,46 @@ fn gpu_ldexp_f16_zero_inf_and_large_exponents() {
     }
 }
 
+/// v_med3_f32 / v_med3_f16 with a quiet NaN operand: the hardware returns
+/// v_min(v_min(s0, s1), s2), the smaller of the other two (LLVM's amdgcn_fmed3 folding,
+/// AMDGPUInstCombineIntrinsic.cpp), wherever the NaN is; without a NaN, the median (#678).
+#[test]
+fn gpu_med3_with_a_nan_operand_is_the_min_of_the_others() {
+    for wave64 in gpu_waves() {
+        let p = prog(&[
+            ("V_MED3_F32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+            ("V_MED3_F16", "ENC_VOP3", &[("VDST", 11), ("SRC0", V + 3), ("SRC1", V + 4), ("SRC2", V + 5)], None),
+        ]);
+        let (dxil, mem) = kernel_wave(&p, wave64);
+        let n = f32::NAN;
+        let h = |x: f32| if x.is_nan() { 0x7E00 } else { half_bits(x) };
+        // (s0, s1, s2, want)
+        let cases: [(f32, f32, f32, f32); 10] = [
+            (n, 2.0, 1.0, 1.0), (n, 1.0, 2.0, 1.0), (2.0, n, 1.0, 1.0), (1.0, n, 2.0, 1.0),
+            (2.0, 1.0, n, 1.0), (1.0, 2.0, n, 1.0), (n, 0.0, 1.0, 0.0), (-3.0, n, 5.0, -3.0),
+            (3.0, 1.0, 2.0, 2.0), (n, n, 4.0, 4.0),
+        ];
+        let mut st = KernelState::default();
+        for (l, r) in st.vgpr.iter_mut().enumerate() {
+            let (a, b, c, _) = cases[l % cases.len()];
+            (r[0], r[1], r[2]) = (a.to_bits(), b.to_bits(), c.to_bits());
+            (r[3], r[4], r[5]) = (h(a), h(b), h(c));
+        }
+        let r = runner::run(&dxil, &st, &mem).unwrap();
+        let mut bad = Vec::new();
+        for (l, (a, b, c, want)) in cases.iter().enumerate() {
+            let (g32, g16) = (r.vgpr[l][10], r.vgpr[l][11] & 0xFFFF);
+            if g32 != want.to_bits() {
+                bad.push(format!("med3_f32({a}, {b}, {c}) = {}, want {want}", f32::from_bits(g32)));
+            }
+            if g16 != h(*want) {
+                bad.push(format!("med3_f16({a}, {b}, {c}) = {g16:#06x}, want {:#06x}", h(*want)));
+            }
+        }
+        assert!(bad.is_empty(), "wave{}: {} wrong\n{}", if wave64 { 64 } else { 32 }, bad.len(), bad.join("\n"));
+    }
+}
+
 /// f32 → IEEE half bits (exact for the small values used in tests).
 fn half_bits(x: f32) -> u32 {
     if x == 0.0 {
