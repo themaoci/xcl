@@ -3379,6 +3379,15 @@ impl Em {
             self.write_mask(&dst, &cond);
             return Ok(());
         }
+        if name == "v_div_scale_f64" {
+            // as v_div_scale_f32: no pre-scaling, src0 unchanged, VCC 0 = no post-scale in
+            // v_div_fmas_f64. v_div_fixup_f64 takes the ranges where the scaling matters.
+            let sdst = outs.get(1).map(|o| Self::dst_of(d, o)).unwrap_or(Dst::S(106));
+            self.write_mask(&sdst, "false");
+            self.line(&format!("double {t}_d = {}; uint {t}_l, {t}_h; asuint({t}_d, {t}_l, {t}_h);", f64v(0)));
+            self.write64(&dst, &format!("{t}_l"), &format!("{t}_h"));
+            return Ok(());
+        }
         let r64: String = match name {
             "v_lshlrev_b64" => format!("({} << ({} & 63u))", u64v(1), lo_hi[0].0),
             "v_lshrrev_b64" => format!("({} >> ({} & 63u))", u64v(1), lo_hi[0].0),
@@ -3402,6 +3411,8 @@ impl Em {
                     "v_add_f64" => format!("{} + {}", f64v(0), f64v(1)),
                     "v_mul_f64" => format!("{} * {}", f64v(0), f64v(1)),
                     "v_fma_f64" => format!("fma({}, {}, {})", f64v(0), f64v(1), f64v(2)),
+                    "v_div_fmas_f64" => format!("fma({}, {}, {})", f64v(0), f64v(1), f64v(2)),
+                    "v_div_fixup_f64" => format!("div_fixup_d({}, {}, {})", f64v(0), f64v(1), f64v(2)),
                     "v_min_f64" => format!("min({}, {})", f64v(0), f64v(1)),
                     "v_max_f64" => format!("max({}, {})", f64v(0), f64v(1)),
                     "v_rcp_f64" => format!("(1.0 / {})", f64v(0)),
@@ -6263,6 +6274,57 @@ double ldexp_d(double x, int n) {
     }
     r *= asdouble(0u, (uint)(n + 1023) << 20);
     return r;
+}
+// n / d for finite, nonzero n and d, correctly rounded, denormal results included: the
+// mantissas (in [0.5, 1)) are divided, `precise`, and the quotient scaled back. A quotient below
+// 2^-1022 is rounded once from the 53-bit quotient and the sign of its exact remainder.
+double div_d(double n, double d) {
+    uint nl, nh, dl, dh; asuint(n, nl, nh); asuint(d, dl, dh);
+    uint sign = (nh ^ dh) & 0x80000000u;
+    int en = frexp_exp_d(n), ed = frexp_exp_d(d);
+    precise double mn = abs(ldexp_d(n, -en));
+    precise double md = abs(ldexp_d(d, -ed));
+    precise double r = mn / md;
+    // Refine once and correct any remaining 1-ULP error from approximate driver f64 division
+    // (e.g. RADV wave64 lowers double `/` via reciprocal) using the exact FMA remainder.
+    precise double rem = fma(-md, r, mn);
+    r = fma(rem, 1.0 / md, r);
+    rem = fma(-md, r, mn);
+    double u_up = r >= 1.0 ? asdouble(0u, 0x3CB00000u) : asdouble(0u, 0x3CA00000u);
+    double u_dn = r > 1.0 ? asdouble(0u, 0x3CB00000u) : asdouble(0u, 0x3CA00000u);
+    uint rl0, rh0; asuint(r, rl0, rh0);
+    if (rem > 0.0) {
+        double half = md * (0.5 * u_up);
+        if (rem > half || (rem == half && (rl0 & 1u) != 0u)) { r = r + u_up; rem = fma(-md, r, mn); }
+    } else if (rem < 0.0) {
+        double half = md * (0.5 * u_dn);
+        if (-rem > half || (-rem == half && (rl0 & 1u) != 0u)) { r = r - u_dn; rem = fma(-md, r, mn); }
+    }
+    int k = en - ed, er = frexp_exp_d(r);
+    if (er + k >= -1021) { uint l, h; asuint(ldexp_d(r, k), l, h); return asdouble(l, h | sign); }
+    int s = -1021 - er - k;
+    if (s >= 55) return asdouble(0u, sign);
+    uint rl, rh; asuint(r, rl, rh);
+    uint64_t m = ((uint64_t)((rh & 0xFFFFFu) | 0x100000u) << 32) | (uint64_t)rl;
+    uint64_t t = m >> (uint)s, low = m & ((1ull << (uint)s) - 1ull), hb = 1ull << (uint)(s - 1);
+    if (low > hb || (low == hb && (rem > 0.0 || (rem == 0.0 && (t & 1ull) != 0ull)))) t += 1ull;
+    return asdouble((uint)t, (uint)(t >> 32) | sign);
+}
+// v_div_fixup_f64(q, d, n): the IEEE special cases of n / d, else q with the sign of n / d.
+// v_div_scale_f64 does not scale (its VCC is 0), so where its scaling matters (n below 2^-968,
+// d outside [2^-1020, 2^1020) or q outside [2^-1020, 2^1023)) the quotient is div_d's instead.
+double div_fixup_d(double q, double d, double n) {
+    uint nl, nh, dl, dh, ql, qh; asuint(n, nl, nh); asuint(d, dl, dh); asuint(q, ql, qh);
+    uint sign = (nh ^ dh) & 0x80000000u;
+    if (isnan_d(n)) return asdouble(nl, nh | 0x00080000u);
+    if (isnan_d(d)) return asdouble(dl, dh | 0x00080000u);
+    bool n0 = ((nh & 0x7FFFFFFFu) | nl) == 0u, d0 = ((dh & 0x7FFFFFFFu) | dl) == 0u;
+    if ((n0 && d0) || (isinf_d(n) && isinf_d(d))) return asdouble(0u, 0x7FF80000u);
+    if (d0 || isinf_d(n)) return asdouble(0u, sign | 0x7FF00000u);
+    if (n0 || isinf_d(d)) return asdouble(0u, sign);
+    uint e_n = (nh >> 20) & 0x7FFu, e_d = (dh >> 20) & 0x7FFu, e_q = (qh >> 20) & 0x7FFu;
+    if (e_n >= 55u && e_d >= 3u && e_d <= 2042u && e_q >= 3u && e_q <= 2045u) return asdouble(ql, (qh & 0x7FFFFFFFu) | sign);
+    return div_d(n, d);
 }
 // HLSL has no f64 sqrt, its sqrt works in f32. x is scaled by 2^-2k into [0.5, 2), its f32 root
 // is refined by two Newton steps in f64, the second with an exact fma residual, and the result

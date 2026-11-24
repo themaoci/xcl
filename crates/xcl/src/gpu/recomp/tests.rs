@@ -1207,6 +1207,89 @@ fn ldexp_f64(wave64: bool) {
     assert!(bad.is_empty(), "wave{lanes}:\n{}", bad.join("\n"));
 }
 
+/// The f64 division sequence LLVM emits (v_div_scale_f64, v_rcp_f64, Newton steps,
+/// v_div_fmas_f64, v_div_fixup_f64): n in v[0:1], d in v[2:3], n / d in v[14:15].
+fn div_f64_sequence() -> Vec<u8> {
+    let vop3 = |n: &'static str, f: &[(&'static str, u64)]| (n, "ENC_VOP3", f.to_vec(), None);
+    let scale = |dst: u64, s0: u64| ("V_DIV_SCALE_F64", "VOP3_SDST_ENC", vec![("VDST", dst), ("SDST", 106), ("SRC0", V + s0), ("SRC1", V + 2), ("SRC2", V)], None);
+    let list: Vec<(&str, &str, Vec<(&str, u64)>, Option<u32>)> = vec![
+        scale(4, 2),                                                                        // d
+        ("V_RCP_F64", "ENC_VOP1", vec![("VDST", 6), ("SRC0", V + 4)], None),
+        vop3("V_FMA_F64", &[("VDST", 8), ("SRC0", V + 4), ("SRC1", V + 6), ("SRC2", 242), ("NEG", 1)]), // 1 - d·r
+        vop3("V_FMA_F64", &[("VDST", 6), ("SRC0", V + 6), ("SRC1", V + 8), ("SRC2", V + 6)]),
+        vop3("V_FMA_F64", &[("VDST", 8), ("SRC0", V + 4), ("SRC1", V + 6), ("SRC2", 242), ("NEG", 1)]),
+        vop3("V_FMA_F64", &[("VDST", 6), ("SRC0", V + 6), ("SRC1", V + 8), ("SRC2", V + 6)]),
+        scale(8, 0),                                                                        // n
+        vop3("V_MUL_F64", &[("VDST", 10), ("SRC0", V + 8), ("SRC1", V + 6)]),
+        vop3("V_FMA_F64", &[("VDST", 12), ("SRC0", V + 4), ("SRC1", V + 10), ("SRC2", V + 8), ("NEG", 1)]),
+        vop3("V_DIV_FMAS_F64", &[("VDST", 12), ("SRC0", V + 12), ("SRC1", V + 6), ("SRC2", V + 10)]),
+        vop3("V_DIV_FIXUP_F64", &[("VDST", 14), ("SRC0", V + 12), ("SRC1", V + 2), ("SRC2", V)]),
+    ];
+    let list: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(n, e, f, l)| (*n, *e, f.as_slice(), *l)).collect();
+    prog(&list)
+}
+
+#[test]
+fn div_f64_translates() {
+    let t = translate(&div_f64_sequence(), &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
+    assert!(t.hlsl.contains("div_fixup_d("), "{}", t.hlsl);
+    if super::dxc::location().is_ok() {
+        super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+    }
+}
+
+/// n / d through the whole sequence matches the CPU's IEEE division bit for bit: exact cases,
+/// denormal n, d or quotient, d beyond 2^1020, overflow, every special case, random pairs.
+#[test]
+fn gpu_div_f64() {
+    for wave64 in gpu_waves() {
+        div_f64(wave64);
+    }
+}
+
+fn div_f64(wave64: bool) {
+    let code = div_f64_sequence();
+    let h = f64::from_bits;
+    let mut pairs: Vec<(f64, f64)> = vec![
+        (1.0, 3.0), (2.0, 3.0), (6.0, 2.0), (-7.0, 0.1), (1.0, 10.0), (0.1, 0.3),
+        (h(0x0006_2891_79f5_c564), h(0x2fe6_78a5_ab07_0d14)), // denormal n
+        (h(1), 3.0), (h(1), h(1)), (h(0x000F_FFFF_FFFF_FFFF), 0.5),
+        (p2f(-1000), h(1)), (1.0, h(3)),                     // denormal d, the second overflows
+        (1e308, 5e307), (1.5, 1.7e308), (f64::MAX, f64::MAX), // d above 2^1020
+        (1e-300, 3e10), (1e-300, 1e20), (-1e-310, 7.0),       // denormal quotients
+        (1e300, 1e-10), (-f64::MAX, 0.5), (f64::MIN_POSITIVE, f64::MAX),
+        (0.0, 0.0), (f64::INFINITY, f64::NEG_INFINITY), (1.0, 0.0), (-1.0, 0.0), (1.0, -0.0),
+        (0.0, 5.0), (-0.0, 5.0), (f64::INFINITY, 2.0), (2.0, f64::INFINITY), (-2.0, f64::INFINITY),
+        (f64::NAN, 1.0), (1.0, f64::NAN), (0.0, f64::NAN),
+    ];
+    let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+    while pairs.len() < 8 * 64 {
+        pairs.push((rand_f64(&mut rng), rand_f64(&mut rng)));
+    }
+    let mut bad = Vec::new();
+    let mut lanes = 0;
+    for chunk in pairs.chunks(if wave64 { 64 } else { 32 }) {
+        let mut st = KernelState::default();
+        for (l, r) in st.vgpr.iter_mut().enumerate() {
+            let (n, d) = chunk[l % chunk.len()];
+            (r[0], r[1], r[2], r[3]) = (n.to_bits() as u32, (n.to_bits() >> 32) as u32, d.to_bits() as u32, (d.to_bits() >> 32) as u32);
+        }
+        let (r, ran) = run_wave(&code, &st, wave64);
+        lanes = ran;
+        for (l, v) in r.vgpr.iter().take(ran).enumerate() {
+            let (n, d) = chunk[l % chunk.len()];
+            let (got, want) = (pair(v, 14), n / d);
+            if got.to_bits() != want.to_bits() && !(got.is_nan() && want.is_nan()) {
+                bad.push(format!("{n:e} / {d:e} = {got:e} ({:#018x}), want {want:e} ({:#018x})", got.to_bits(), want.to_bits()));
+            }
+        }
+    }
+    bad.sort();
+    bad.dedup();
+    assert!(bad.is_empty(), "wave{lanes}:\n{}", bad.join("\n"));
+}
+
 #[test]
 fn gpu_valu_float_and_int() {
     if !gpu_ready() {
